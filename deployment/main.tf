@@ -1,11 +1,11 @@
 resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   count     = 2
   name      = "vpn-node-0${count.index + 1}"
-  node_name = "pve2" # Proxmox node name
+  node_name = "pve2"
   vm_id     = 200 + count.index
 
   clone {
-    vm_id = 104 # Ubuntu 24.04 Template ID
+    vm_id = 104
   }
 
   initialization {
@@ -20,6 +20,10 @@ resource "proxmox_virtual_environment_vm" "vpn_nodes" {
       username = "user"
       keys     = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB5HDZjLiZygMdm2pJHzDm+AgD82j4q9PL0kXgBJEeK9 root@openclaw01"]
     }
+  }
+
+  agent {
+    enabled = false 
   }
 
   network_device {
