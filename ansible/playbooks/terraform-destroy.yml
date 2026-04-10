@@ -1,0 +1,26 @@
+---
+- name: Run Terraform Destroy
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    terraform_base_path: /root/.openclaw/workspace/projects/cyl-dc/ansible/terraform/deployment
+    targets:
+      - pve
+      - pve2
+
+  tasks:
+    - name: Terraform destroy for "{{ target }}"
+      community.general.terraform:
+        state: absent
+        project_path: "{{ terraform_base_path }}/{{ target }}"
+        force_init: true
+      register: terraform_destroy
+      loop: "{{ targets }}"
+      loop_control:
+        loop_var: target
+
+    - name: Display destroy results
+      ansible.builtin.debug:
+        msg: "Destroy completed for all targets"

@@ -1,0 +1,66 @@
+---
+- name: WireGuard VPN Configuration for pve and pve2
+  hosts: pve_nodes
+  gather_facts: true
+  become: true
+
+  vars:
+    wireguard_internal_ip: "{{ hostvars[inventory_hostname].wireguard_ip }}"
+    wireguard_listen_port: 51820
+    wireguard_peers: "{{ groups['pve_nodes'] | map('extract', hostvars) | list }}"
+
+  tasks:
+    - name: Install WireGuard
+      ansible.builtin.apt:
+        name: wireguard
+        state: present
+        update_cache: yes
+
+    - name: Generate WireGuard private key
+      ansible.builtin.shell: |
+        wg genkey
+      register: wg_private_key_raw
+      changed_when: false
+      when: wg_private_key is not defined
+
+    - name: Set WireGuard private key fact
+      ansible.builtin.set_fact:
+        wg_private_key: "{{ wg_private_key_raw.stdout }}"
+      when: wg_private_key is not defined
+
+    - name: Generate WireGuard public key
+      ansible.builtin.shell: |
+        echo "{{ wg_private_key }}" | wg pubkey
+      register: wg_public_key_raw
+      changed_when: false
+
+    - name: Set WireGuard public key fact
+      ansible.builtin.set_fact:
+        wg_public_key: "{{ wg_public_key_raw.stdout }}"
+
+    - name: Create WireGuard config directory
+      ansible.builtin.file:
+        path: /etc/wireguard
+        state: directory
+        mode: '0755'
+
+    - name: Configure WireGuard wg0
+      ansible.builtin.template:
+        src: templates/wg0.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        mode: '0600'
+        validate: 'wg-quick check %s'
+
+    - name: Enable and start WireGuard
+      ansible.builtin.systemd:
+        name: wireguard
+        enabled: true
+        state: started
+
+    - name: Show WireGuard status
+      ansible.builtin.shell: wg show
+      changed_when: false
+
+    - name: Debug WireGuard info
+      ansible.builtin.debug:
+        msg: "Node: {{ inventory_hostname }}, Internal IP: {{ wireguard_internal_ip }}, Public Key: {{ wg_public_key }}"

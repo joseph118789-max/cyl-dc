@@ -1,0 +1,31 @@
+---
+- name: Run Terraform Apply
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    terraform_base_path: /root/.openclaw/workspace/projects/cyl-dc/ansible/terraform/deployment
+
+  tasks:
+    - name: Terraform apply on pve
+      community.general.terraform:
+        state: present
+        project_path: "{{ terraform_base_path }}/pve"
+        force_init: true
+      register: terraform_pve
+
+    - name: Display pve outputs
+      ansible.builtin.debug:
+        var: terraform_pve.outputs
+
+    - name: Terraform apply on pve2
+      community.general.terraform:
+        state: present
+        project_path: "{{ terraform_base_path }}/pve2"
+        force_init: true
+      register: terraform_pve2
+
+    - name: Display pve2 outputs
+      ansible.builtin.debug:
+        var: terraform_pve2.outputs

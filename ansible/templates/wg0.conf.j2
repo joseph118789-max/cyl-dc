@@ -1,0 +1,16 @@
+[Interface]
+Address = {{ wireguard_internal_ip }}
+PrivateKey = {{ wg_private_key }}
+ListenPort = {{ wireguard_listen_port }}
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+{% for peer in wireguard_peers %}
+{% if peer.wireguard_ip != wireguard_internal_ip %}
+[Peer]
+PublicKey = {{ peer.wg_public_key }}
+AllowedIPs = {{ peer.wireguard_ip }}
+Endpoint = {{ peer.ansible_host }}:51820
+PersistentKeepalive = 25
+{% endif %}
+{% endfor %}

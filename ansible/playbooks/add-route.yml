@@ -1,0 +1,23 @@
+---
+- name: Add Static Route for pve2 network
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Add route to 192.168.11.0/24 via 192.168.1.200
+      ansible.builtin.shell: |
+        ip route add 192.168.11.0/24 via 192.168.1.200
+      changed_when: false
+      register: route_add
+
+    - name: Verify route
+      ansible.builtin.shell: |
+        ip route show | grep 192.168.11.0
+      changed_when: false
+      register: route_show
+
+    - name: Display route status
+      ansible.builtin.debug:
+        var: route_show.stdout
