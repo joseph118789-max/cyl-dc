@@ -12,7 +12,7 @@ resource "proxmox_virtual_environment_vm" "vpn_nodes" {
     ip_config {
       ipv4 {
         address = "192.168.11.${150 + count.index}/24"
-        gateway = "192.168.11.1"
+        gateway = "192.168.11.2"
       }
     }
     
