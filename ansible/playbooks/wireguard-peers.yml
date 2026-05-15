@@ -1,0 +1,195 @@
+---
+- name: Configure WireGuard Peers
+  hosts: pve_nodes
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Get WireGuard private key
+      ansible.builtin.shell: wg show wg0 private-key 2>/dev/null || echo ""
+      register: wg_private
+      changed_when: false
+      ignore_errors: true
+
+    - name: Generate new WireGuard keys if needed
+      when: wg_private.stdout == ""
+      block:
+        - name: Generate private key
+          ansible.builtin.shell: wg genkey
+          register: gen_private
+          changed_when: false
+
+        - name: Set private key fact
+          ansible.builtin.set_fact:
+            wg_private_key: "{{ gen_private.stdout }}"
+
+        - name: Generate public key
+          ansible.builtin.shell: "echo {{ gen_private.stdout }} | wg pubkey"
+          register: gen_public
+          changed_when: false
+
+        - name: Set public key fact
+          ansible.builtin.set_fact:
+            wg_public_key: "{{ gen_public.stdout }}"
+
+    - name: Get existing public key
+      when: wg_private.stdout != ""
+      block:
+        - name: Get public key from existing private key
+          ansible.builtin.shell: "echo {{ wg_private.stdout }} | wg pubkey"
+          register: existing_public
+          changed_when: false
+
+        - name: Set facts
+          ansible.builtin.set_fact:
+            wg_private_key: "{{ wg_private.stdout }}"
+            wg_public_key: "{{ existing_public.stdout }}"
+
+- name: Collect WireGuard Info
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Get public keys from all nodes
+      ansible.builtin.shell: |
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 user@{{ hostvars[item].ansible_host }} "sudo wg show wg0 public-key 2>/dev/null || echo 'NOT_CONFIGURED'"
+      loop:
+        - k3s01
+        - k3s02
+        - k3s03
+        - k3s04
+      register: node_keys
+      changed_when: false
+
+    - name: Store k3s01 public key
+      ansible.builtin.set_fact:
+        k3s01_key: "{{ node_keys.results[0].stdout }}"
+
+    - name: Store k3s02 public key
+      ansible.builtin.set_fact:
+        k3s02_key: "{{ node_keys.results[1].stdout }}"
+
+    - name: Store k3s03 public key
+      ansible.builtin.set_fact:
+        k3s03_key: "{{ node_keys.results[2].stdout }}"
+
+    - name: Store k3s04 public key
+      ansible.builtin.set_fact:
+        k3s04_key: "{{ node_keys.results[3].stdout }}"
+
+- name: Configure WireGuard Peers on Each Node
+  hosts: pve_nodes
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Configure WireGuard with all peers
+      ansible.builtin.copy:
+        dest: /etc/wireguard/wg0.conf
+        content: |
+          [Interface]
+          Address = {{ hostvars[inventory_hostname].wireguard_ip }}
+          PrivateKey = {{ hostvars[inventory_hostname].wg_private_key }}
+          ListenPort = 51820
+
+          {% if inventory_hostname == 'k3s01' %}
+          # k3s02 is on same LAN (192.168.1.151), direct eth0, no WG endpoint needed
+          [Peer]
+          PublicKey = {{ hostvars['k3s02'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.3/32, 192.168.1.151/32
+          PersistentKeepalive = 25
+
+          # k3s03/k3s04 on 192.168.11.x - need WG to reach
+          [Peer]
+          PublicKey = {{ hostvars['k3s03'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.2/32, 192.168.11.150/32
+          Endpoint = 192.168.11.150:51820
+          PersistentKeepalive = 25
+
+          [Peer]
+          PublicKey = {{ hostvars['k3s04'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.4/32, 192.168.11.151/32
+          Endpoint = 192.168.11.151:51820
+          PersistentKeepalive = 25
+          {% endif %}
+
+          {% if inventory_hostname == 'k3s02' %}
+          # k3s01 on 192.168.1.150 - direct LAN/WG
+          [Peer]
+          PublicKey = {{ hostvars['k3s01'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.1/32, 192.168.1.150/32
+          Endpoint = 192.168.1.150:51820
+          PersistentKeepalive = 25
+
+          # k3s03/k3s04 on 192.168.11.x - need WG
+          [Peer]
+          PublicKey = {{ hostvars['k3s03'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.2/32, 192.168.11.150/32
+          Endpoint = 192.168.11.150:51820
+          PersistentKeepalive = 25
+
+          [Peer]
+          PublicKey = {{ hostvars['k3s04'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.4/32, 192.168.11.151/32
+          Endpoint = 192.168.11.151:51820
+          PersistentKeepalive = 25
+          {% endif %}
+
+          {% if inventory_hostname == 'k3s03' %}
+          # k3s01/k3s02 on 192.168.1.x - need WG tunnel to reach LAN
+          [Peer]
+          PublicKey = {{ hostvars['k3s01'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.1/32, 192.168.1.0/24, 10.42.0.0/16
+          Endpoint = 192.168.1.150:51820
+          PersistentKeepalive = 25
+
+          [Peer]
+          PublicKey = {{ hostvars['k3s02'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.3/32, 192.168.1.151/32
+          Endpoint = 192.168.1.151:51820
+          PersistentKeepalive = 25
+
+          # k3s04 on same subnet
+          [Peer]
+          PublicKey = {{ hostvars['k3s04'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.4/32, 192.168.11.151/32
+          PersistentKeepalive = 25
+          {% endif %}
+
+          {% if inventory_hostname == 'k3s04' %}
+          # k3s01/k3s02 on 192.168.1.x - need WG tunnel
+          [Peer]
+          PublicKey = {{ hostvars['k3s01'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.1/32, 192.168.1.0/24, 10.42.0.0/16
+          Endpoint = 192.168.1.150:51820
+          PersistentKeepalive = 25
+
+          [Peer]
+          PublicKey = {{ hostvars['k3s02'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.3/32, 192.168.1.151/32
+          Endpoint = 192.168.1.151:51820
+          PersistentKeepalive = 25
+
+          # k3s03 on same subnet
+          [Peer]
+          PublicKey = {{ hostvars['k3s03'].wg_public_key | default('NOT_SET') }}
+          AllowedIPs = 10.0.0.2/32, 192.168.11.150/32
+          PersistentKeepalive = 25
+          {% endif %}
+        mode: '0600'
+
+    - name: Restart WireGuard
+      ansible.builtin.systemd:
+        name: wg-quick@wg0
+        state: restarted
+        enabled: true
+      ignore_errors: true
+
+    - name: Show WireGuard status
+      ansible.builtin.shell: wg show
+      changed_when: false
+      ignore_errors: true

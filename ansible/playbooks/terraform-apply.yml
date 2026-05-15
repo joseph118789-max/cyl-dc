@@ -29,3 +29,9 @@
     - name: Display pve2 outputs
       ansible.builtin.debug:
         var: terraform_pve2.outputs
+
+    - name: Wait for VMs to boot
+      ansible.builtin.wait_for:
+        timeout: 30
+
+- import_playbook: disk-resize.yml

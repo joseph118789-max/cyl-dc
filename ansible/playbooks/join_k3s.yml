@@ -1,0 +1,205 @@
+---
+- name: Clean up nodes
+  hosts: k3s_cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Stop K3s services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      failed_when: false
+      loop:
+        - k3s
+        - k3s-agent
+
+    - name: Kill remaining processes
+      ansible.builtin.shell: |
+        pkill -9 k3s 2>/dev/null || true
+        pkill -9 containerd-shim 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+
+    - name: Clean up directories
+      ansible.builtin.shell: |
+        rm -rf /var/lib/rancher /etc/rancher /run/k3s
+      changed_when: false
+      failed_when: false
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+- name: Get Node Token from First Master
+  hosts: master[0]
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Start K3s if not running
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+
+    - name: Wait for API
+      ansible.builtin.wait_for:
+        port: 6443
+        delay: 10
+        timeout: 60
+
+    - name: Get Node Token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+
+    - name: Save Node Token to controller
+      ansible.builtin.copy:
+        content: "{{ node_token.content | b64decode | trim }}"
+        dest: /tmp/k3s_node_token
+        mode: '0644'
+      delegate_to: localhost
+      when: node_token.content is defined
+
+- name: Distribute Token
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Read token
+      ansible.builtin.slurp:
+        src: /tmp/k3s_node_token
+      register: token_data
+      failed_when: false
+
+    - name: Copy token to k3s02
+      ansible.builtin.copy:
+        content: "{{ token_data.content | b64decode | trim }}"
+        dest: /tmp/k3s_token
+        mode: '0644'
+      delegate_to: k3s02
+      when: token_data.content is defined
+
+    - name: Copy token to k3s03
+      ansible.builtin.copy:
+        content: "{{ token_data.content | b64decode | trim }}"
+        dest: /tmp/k3s_token
+        mode: '0644'
+      delegate_to: k3s03
+      when: token_data.content is defined
+
+    - name: Copy token to k3s04
+      ansible.builtin.copy:
+        content: "{{ token_data.content | b64decode | trim }}"
+        dest: /tmp/k3s_token
+        mode: '0644'
+      delegate_to: k3s04
+      when: token_data.content is defined
+
+- name: Join Second Master
+  hosts: master[1]
+  become: true
+  vars:
+    first_master_lan: "{{ hostvars[groups['master'][0]]['ansible_host'] }}"
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Read token from local file
+      ansible.builtin.slurp:
+        src: /tmp/k3s_token
+      register: token_data
+      failed_when: false
+
+    - name: Write token for lookup
+      ansible.builtin.copy:
+        content: "{{ token_data.content | b64decode | trim }}"
+        dest: /tmp/k3s_token_fetched
+        mode: '0644'
+      when: token_data.content is defined
+
+    - name: Install K3s master
+      ansible.builtin.shell: |
+        TOKEN=$(cat /tmp/k3s_token_fetched)
+        K3S_TOKEN="$TOKEN" curl -sfL https://get.k3s.io | sh -s - server \
+        --server https://{{ first_master_lan }}:6443 \
+        --disable traefik \
+        --disable servicelb \
+        --write-kubeconfig-mode 644
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+
+    - name: Start K3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        daemon_reload: yes
+
+- name: Join Workers
+  hosts: worker
+  become: true
+  vars:
+    first_master_lan: "{{ hostvars[groups['master'][0]]['ansible_host'] }}"
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Read token from local file
+      ansible.builtin.slurp:
+        src: /tmp/k3s_token
+      register: token_data
+      failed_when: false
+
+    - name: Write token for lookup
+      ansible.builtin.copy:
+        content: "{{ token_data.content | b64decode | trim }}"
+        dest: /tmp/k3s_token_fetched
+        mode: '0644'
+      when: token_data.content is defined
+
+    - name: Install K3s agent
+      ansible.builtin.shell: |
+        TOKEN=$(cat /tmp/k3s_token_fetched) && export K3S_URL="https://{{ first_master_lan }}:6443" && export K3S_TOKEN="$TOKEN" && curl -sfL https://get.k3s.io | sh -s - agent --flannel-iface=wg0 --node-ip={{ wireguard_ip | trim('/24') }}
+      args:
+        creates: /etc/rancher/k3s/k3s-agent.yaml
+
+    - name: Create agent env file
+      ansible.builtin.copy:
+        content: |
+          K3S_URL=https://{{ first_master_lan }}:6443
+          K3S_TOKEN=
+        dest: /etc/systemd/system/k3s-agent.service.env
+        mode: '0644'
+
+    - name: Add token to env file
+      ansible.builtin.shell: |
+        echo "K3S_TOKEN=$(cat /tmp/k3s_token_fetched)" >> /etc/systemd/system/k3s-agent.service.env
+
+    - name: Start k3s-agent
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: started
+        daemon_reload: yes
+
+- name: Verify Cluster
+  hosts: master[0]
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Check nodes
+      ansible.builtin.shell: |
+        for i in {1..18}; do
+          sleep 10
+          NODES=$(k3s kubectl get nodes 2>/dev/null | wc -l)
+          if [ "$NODES" -ge 4 ]; then
+            break
+          fi
+        done
+        k3s kubectl get nodes -o wide
+      changed_when: false
+      register: cluster_status
+
+    - name: Show status
+      ansible.builtin.debug:
+        var: cluster_status.stdout_lines

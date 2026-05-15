@@ -1,0 +1,13 @@
+---
+- name: Reboot inventory VMs
+  hosts: pve_nodes
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Reboot the VM
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        connect_timeout: 5
+        pre_reboot_delay: 5
+        post_reboot_delay: 30

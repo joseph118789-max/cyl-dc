@@ -1,3 +1,7 @@
+# Terraform config for k3s nodes on PVE2
+# Storage: local1 on node pve2
+# Note: Disk management handled separately - template provides disk
+
 resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   count     = 2
   name      = "k3s0${count.index + 3}"
@@ -5,10 +9,13 @@ resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   vm_id     = 200 + count.index
 
   clone {
-    vm_id = 104
+    vm_id    = 104
+    full     = true
+    retries  = 1
   }
 
   initialization {
+    datastore_id = "local1"
     ip_config {
       ipv4 {
         address = "192.168.11.${150 + count.index}/24"
@@ -23,7 +30,8 @@ resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   }
 
   agent {
-    enabled = false 
+    enabled = true 
+    type    = "virtio"
   }
 
   network_device {

@@ -1,0 +1,66 @@
+---
+# Longhorn Installation Playbook for K3s
+# Usage: ansible-playbook playbooks/longhorn.yml
+
+- name: Install Longhorn on K3s Cluster
+  hosts: k3s_cluster
+  become: yes
+  gather_facts: yes
+  vars:
+    longhorn_version: v1.6.0
+
+  tasks:
+    - name: Install open-iscsi on host (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: open-iscsi
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Install open-iscsi on host (RHEL/CentOS)
+      ansible.builtin.yum:
+        name: iscsi-initiator-utils
+        state: present
+      when: ansible_os_family in ["RedHat", "CentOS"]
+
+    - name: Enable iscsid service
+      ansible.builtin.systemd:
+        name: iscsid
+        enabled: yes
+        state: started
+
+    - name: Ensure Longhorn data directory exists
+      ansible.builtin.file:
+        path: /var/lib/longhorn
+        state: directory
+        mode: '0755'
+
+    - name: Apply Longhorn manifests (master node only)
+      ansible.builtin.shell:
+        cmd: kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/{{ longhorn_version }}/deploy/longhorn.yaml
+      register: longhorn_install
+      changed_when: "'created' in longhorn_install.stdout or 'configured' in longhorn_install.stdout"
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Wait for Longhorn pods
+      ansible.builtin.shell:
+        cmd: kubectl get pods -n longhorn-system -o jsonpath='{.items[*].status.phase}'
+      register: pod_status
+      until: "'Running' in pod_status.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Set Longhorn as default storage class (master node only)
+      ansible.builtin.shell:
+        cmd: kubectl patch storageclass longhorn -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Display status
+      ansible.builtin.shell:
+        cmd: kubectl get pods -n longhorn-system && kubectl get sc
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]

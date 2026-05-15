@@ -1,0 +1,144 @@
+---
+# Disk Resize Playbook for K3s Nodes
+# Resizes the root disk partition and LVM after VM cloning
+# Adds second disk to LVM for extra storage
+# Usage: ansible-playbook playbooks/disk-resize.yml
+
+- name: Resize root disk and extend LVM with additional disk
+  hosts: k3s_cluster
+  become: yes
+  gather_facts: yes
+  vars:
+    # Root disk (from template)
+    root_disk_device: /dev/sda
+    root_partition: "{{ root_disk_device }}3"
+    lvm_vg: ubuntu-vg
+    lvm_lv: ubuntu-lv
+    # Additional disk to add to LVM (should be /dev/sdb)
+    data_disk_device: /dev/sdb
+
+  tasks:
+    - name: Check current root disk size
+      ansible.builtin.shell:
+        cmd: lsblk {{ root_disk_device }} -b --noheadings | awk '{print $4}'
+      register: current_root_size
+      changed_when: false
+
+    - name: Display current root disk size
+      ansible.builtin.debug:
+        msg: "Root disk size: {{ current_root_size.stdout | int | human_readable }}"
+
+    - name: Resize partition 3 to fill root disk
+      ansible.builtin.shell:
+        cmd: growpart {{ root_disk_device }} 3
+      register: growpart_result
+      changed_when: "'changed:' in growpart_result.stdout"
+      failed_when: false
+
+    - name: Expand LVM physical volume on root partition
+      ansible.builtin.shell:
+        cmd: pvresize {{ root_partition }}
+      register: pvresize_result
+      changed_when: "'Physical volume' in pvresize_result.stdout"
+      when: growpart_result.rc == 0
+
+    - name: Detect second disk for LVM extension
+      ansible.builtin.shell:
+        cmd: |
+          lsblk -nd --output NAME,TYPE,SIZE | grep disk | awk '{print $1}' | while read dev; do
+            if [ "$dev" != "{{ root_disk_device | basename }}" ]; then
+              echo "/dev/$dev"
+            fi
+          done
+      register: extra_disks
+      changed_when: false
+
+    - name: Display detected extra disks
+      ansible.builtin.debug:
+        var: extra_disks.stdout_lines
+
+    - name: Create LVM physical volume on extra disk
+      ansible.builtin.shell:
+        cmd: |
+          if [ -b "{{ data_disk_device }}" ]; then
+            pvcreate {{ data_disk_device }}
+          else
+            echo "Extra disk not found"
+          fi
+      register: pvcreate_result
+      changed_when: "'Physical volume' in pvcreate_result.stdout"
+      failed_when: false
+
+    - name: Display PV create result
+      ansible.builtin.debug:
+        var: pvcreate_result.stdout_lines
+
+    - name: Add extra disk to LVM volume group
+      ansible.builtin.shell:
+        cmd: |
+          if [ -b "{{ data_disk_device }}" ]; then
+            vgextend {{ lvm_vg }} {{ data_disk_device }}
+          else
+            echo "Skipping - disk not found"
+          fi
+      register: vgextend_result
+      changed_when: "'Volume group' in vgextend_result.stdout"
+      failed_when: false
+      when: pvcreate_result.rc == 0
+
+    - name: Display VG extend result
+      ansible.builtin.debug:
+        var: vgextend_result.stdout_lines
+
+    - name: Calculate total available space
+      ansible.builtin.shell:
+        cmd: |
+          vgdisplay {{ lvm_vg }} --units g --noheading | awk '/Free/{print $5}' | tr -d ' '
+      register: available_space
+      changed_when: false
+
+    - name: Display available space in VG
+      ansible.builtin.debug:
+        msg: "Available space in {{ lvm_vg }}: {{ available_space.stdout }}"
+
+    - name: Extend root logical volume to use all available space
+      ansible.builtin.shell:
+        cmd: lvextend -l +100%FREE /dev/mapper/{{ lvm_vg }}-{{ lvm_lv }}
+      register: lvextend_result
+      changed_when: "'Logical volume' in lvextend_result.stdout"
+
+    - name: Display LV extension result
+      ansible.builtin.debug:
+        var: lvextend_result.stdout_lines
+
+    - name: Resize filesystem
+      ansible.builtin.shell:
+        cmd: |
+          if command -v xfs_growfs &> /dev/null; then
+            xfs_growfs /
+          elif command -v resize2fs &> /dev/null; then
+            resize2fs /dev/mapper/{{ lvm_vg }}-{{ lvm_lv }}
+          else
+            echo "No resize tool found"
+            exit 1
+          fi
+      register: resize_result
+      changed_when: "'resize' in resize_result.stdout or 'fsadm' in resize_result.stdout"
+
+    - name: Display filesystem resize result
+      ansible.builtin.debug:
+        var: resize_result.stdout_lines
+
+    - name: Verify final disk usage
+      ansible.builtin.shell:
+        cmd: df -h /
+      register: final_df
+      changed_when: false
+
+    - name: Display final disk status
+      ansible.builtin.debug:
+        var: final_df.stdout_lines
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: "Disk resize and LVM extension completed successfully on {{ inventory_hostname }}"

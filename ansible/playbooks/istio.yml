@@ -1,0 +1,60 @@
+---
+# Istio Installation Playbook for K3s
+# Usage: ansible-playbook playbooks/istio.yml
+
+- name: Install Istio on K3s Cluster
+  hosts: master
+  become: yes
+  gather_facts: yes
+  vars:
+    istio_version: "1.29.1"
+
+  tasks:
+    - name: Download Istio
+      ansible.builtin.get_url:
+        url: "https://github.com/istio/istio/releases/download/{{ istio_version }}/istio-{{ istio_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/istio-{{ istio_version }}-linux-amd64.tar.gz"
+        mode: '0644'
+
+    - name: Extract Istio
+      ansible.builtin.unarchive:
+        src: "/tmp/istio-{{ istio_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/"
+        creates: "/tmp/istio-{{ istio_version }}/bin/istioctl"
+        remote_src: yes
+
+    - name: Install istioctl
+      ansible.builtin.copy:
+        src: "/tmp/istio-{{ istio_version }}/bin/istioctl"
+        dest: "/usr/local/bin/istioctl"
+        mode: '0755'
+
+    - name: Install Istio
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          istioctl install --set profile=default -y
+      register: istio_install
+      changed_when: "'Installation complete' in istio_install.stdout"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Enable sidecar injection for default namespace
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl label namespace default istio-injection=enabled --overwrite
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Verify installation
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl get pods -n istio-system
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display results
+      ansible.builtin.debug:
+        var: verification.stdout_lines

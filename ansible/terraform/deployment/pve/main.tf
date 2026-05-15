@@ -1,3 +1,7 @@
+# Terraform config for k3s nodes on PVE
+# Storage: raid-storage on node pve
+# Note: Disk management handled separately - template provides disk
+
 resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   count     = 2
   name      = "k3s0${count.index + 1}"
@@ -5,10 +9,13 @@ resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   vm_id     = 200 + count.index
 
   clone {
-    vm_id = 101
+    vm_id    = 101
+    full     = true
+    retries  = 1
   }
 
   initialization {
+    datastore_id = "raid-storage"
     ip_config {
       ipv4 {
         address = "192.168.1.${150 + count.index}/24"
@@ -23,7 +30,8 @@ resource "proxmox_virtual_environment_vm" "vpn_nodes" {
   }
 
   agent {
-    enabled = false 
+    enabled = true 
+    type    = "virtio"
   }
 
   network_device {
