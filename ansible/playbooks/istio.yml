@@ -24,10 +24,8 @@
         remote_src: yes
 
     - name: Install istioctl
-      ansible.builtin.copy:
-        src: "/tmp/istio-{{ istio_version }}/bin/istioctl"
-        dest: "/usr/local/bin/istioctl"
-        mode: '0755'
+      ansible.builtin.shell:
+        cmd: cp /tmp/istio-{{ istio_version }}/bin/istioctl /usr/local/bin/istioctl && chmod +x /usr/local/bin/istioctl
 
     - name: Install Istio
       ansible.builtin.shell:
