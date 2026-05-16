@@ -1,0 +1,101 @@
+---
+- name: Configure Full-Mesh WireGuard across Cross-Site PVE Nodes
+  hosts: pve_nodes
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install WireGuard tools
+      ansible.builtin.package:
+        name: wireguard
+        state: present
+
+    - name: Enable IPv4 forwarding
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: true
+        state: present
+        reload: true
+
+    - name: Create WireGuard configuration directory
+      ansible.builtin.file:
+        path: /etc/wireguard
+        state: directory
+        mode: '0700'
+
+    - name: Generate WireGuard private key
+      ansible.builtin.command:
+        cmd: wg genkey
+        creates: /etc/wireguard/private.key
+      register: wg_private_key_gen
+
+    - name: Save private key with secure permissions
+      ansible.builtin.shell: |
+        set -o pipefail
+        wg genkey > /etc/wireguard/private.key
+        chmod 600 /etc/wireguard/private.key
+      args:
+        creates: /etc/wireguard/private.key
+        executable: /bin/bash
+
+    - name: Read private key into fact
+      ansible.builtin.slurp:
+        src: /etc/wireguard/private.key
+      register: slurped_private_key
+
+    - name: Set private key fact
+      ansible.builtin.set_fact:
+        wg_private_key: "{{ slurped_private_key.content | b64decode | trim }}"
+
+    - name: Generate WireGuard public key
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "{{ wg_private_key }}" | wg pubkey > /etc/wireguard/public.key
+      args:
+        creates: /etc/wireguard/public.key
+        executable: /bin/bash
+
+    - name: Read public key into fact
+      ansible.builtin.slurp:
+        src: /etc/wireguard/public.key
+      register: slurped_public_key
+
+    - name: Set public key fact
+      ansible.builtin.set_fact:
+        wg_public_key: "{{ slurped_public_key.content | b64decode | trim }}"
+
+    - name: Generate WireGuard configuration (Full Mesh)
+      ansible.builtin.copy:
+        dest: /etc/wireguard/wg0.conf
+        mode: '0600'
+        content: |
+          [Interface]
+          PrivateKey = {{ wg_private_key }}
+          Address = {{ wireguard_ip }}
+          ListenPort = 51820
+
+          {% for host in groups['pve_nodes'] %}
+          {% if host != inventory_hostname %}
+          # Peer: {{ host }}
+          [Peer]
+          PublicKey = {{ hostvars[host]['wg_public_key'] }}
+          AllowedIPs = {{ hostvars[host]['wireguard_ip'].split('/')[0] }}/32
+          Endpoint = {{ hostvars[host]['ansible_host'] }}:51820
+          PersistentKeepalive = 25
+
+          {% endif %}
+          {% endfor %}
+      notify: Restart wireguard
+
+    - name: Ensure WireGuard service is enabled and started
+      ansible.builtin.systemd:
+        name: wg-quick@wg0
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart wireguard
+      ansible.builtin.systemd:
+        name: wg-quick@wg0
+        state: restarted

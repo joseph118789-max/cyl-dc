@@ -1,0 +1,354 @@
+---
+# K3s HA Cluster Setup Over WireGuard Full-Mesh VPN
+#
+# Network topology:
+#   Site 1 (PVE/PVE2 - 192.168.1.0/24):  k3s01 (10.0.0.1), k3s02 (10.0.0.2)
+#   Site 2 (PVE-seekn - 192.168.11.0/24): k3s03 (10.0.0.3), k3s04 (10.0.0.4)
+#   WireGuard overlay: 10.0.0.0/24
+#
+# Key design:
+#   - All k3s internal traffic (apiserver, etcd, flannel) binds to wg0 (10.0.0.x)
+#   - Flannel uses --flannel-iface=wg0 for cross-WAN VXLAN
+#   - etcd heartbeat/election tuned for WAN latency (250ms/2500ms)
+#   - Ansible-native modules, no raw shell where possible, idempotent
+
+- name: Prepare all nodes for K3s deployment
+  hosts: k3s_cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tags: [prepare]
+
+  tasks:
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - jq
+          - open-iscsi
+          - nfs-common
+          - wireguard-tools
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure WireGuard service is enabled and running
+      ansible.builtin.systemd:
+        name: wg-quick@wg0
+        state: started
+        enabled: true
+
+    - name: Verify wg0 interface is UP with correct address
+      ansible.builtin.shell: |
+        set -e
+        ip link show wg0 2>/dev/null | grep -q "state UP" || wg-quick up wg0
+        ip addr show wg0 | grep "{{ wireguard_ip.split('/')[0] }}"
+      args:
+        executable: /bin/bash
+        creates: /run/wg0-up-check
+      register: wg0_check
+      changed_when: wg0_check.rc != 0
+
+    - name: Touch flag file after wg0 verification
+      ansible.builtin.file:
+        path: /run/wg0-up-check
+        state: touch
+        mode: '0644'
+      when: wg0_check.changed
+
+    - name: Enable IP forwarding for cross-subnet communication
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: true
+
+- name: Cleanup existing K3s installation
+  hosts: k3s_cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tags: [cleanup]
+  gather_facts: false
+
+  tasks:
+    - name: Stop K3s and k3s-agent services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+      loop:
+        - k3s
+        - k3s-agent
+
+    - name: Kill remaining K3s processes
+      ansible.builtin.shell: |
+        pkill -9 k3s 2>/dev/null || true
+        pkill -9 containerd-shim 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+
+    - name: Remove K3s data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      failed_when: false
+      loop:
+        - /var/lib/rancher/k3s
+        - /etc/rancher/k3s
+        - /run/k3s
+
+    - name: Reload systemd after cleanup
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+- name: Initialize first K3s master with embedded etcd
+  hosts: master[0]
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tags: [master]
+
+  tasks:
+    - name: Check if K3s is already initialized
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_check
+
+    - name: Initialize K3s cluster master (first node)
+      when: not kubeconfig_check.stat.exists
+      ansible.builtin.shell: |
+        set -e
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --cluster-init \
+          --node-ip={{ wireguard_ip.split('/')[0] }} \
+          --node-external-ip={{ wireguard_ip.split('/')[0] }} \
+          --flannel-iface=wg0 \
+          --bind-address={{ wireguard_ip.split('/')[0] }} \
+          --advertise-address={{ wireguard_ip.split('/')[0] }} \
+          --tls-san={{ wireguard_ip.split('/')[0] }} \
+          --etcd-arg=heartbeat-interval=250 \
+          --etcd-arg=election-timeout=2500 \
+          --disable traefik \
+          --disable servicelb \
+          --write-kubeconfig-mode 644 \
+          --write-kubeconfig=/etc/rancher/k3s/k3s.yaml
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+        executable: /bin/bash
+      register: k3s_init
+
+    - name: Ensure k3s service is enabled and running
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: true
+
+    - name: Wait for API server to be ready
+      ansible.builtin.wait_for:
+        host: "{{ wireguard_ip.split('/')[0] }}"
+        port: 6443
+        delay: 5
+        timeout: 180
+      when: not kubeconfig_check.stat.exists or kubeconfig_check.stat.exists
+
+    - name: Retrieve and save cluster token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: cluster_token
+      failed_when: false
+
+    - name: Write token to shared location on master
+      ansible.builtin.copy:
+        content: "{{ cluster_token.content | b64decode | trim }}"
+        dest: /tmp/k3s_cluster_token
+        mode: '0644'
+      when: cluster_token.content is defined
+
+    - name: Fetch cluster token to controller
+      ansible.builtin.fetch:
+        src: /var/lib/rancher/k3s/server/node-token
+        dest: /tmp/k3s_cluster_token
+        flat: true
+      when: cluster_token.content is defined
+
+    - name: Display cluster initialization status
+      ansible.builtin.shell: |
+        k3s kubectl get nodes -o wide
+        echo "---"
+        k3s kubectl get pods -A
+      changed_when: false
+      register: init_status
+      when: not kubeconfig_check.stat.exists
+
+- name: Read cluster token for distribution
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tags: [token]
+
+  tasks:
+    - name: Slurp cluster token from master node
+      ansible.builtin.slurp:
+        src: /tmp/k3s_cluster_token
+      register: token_bundle
+      retries: 3
+      delay: 5
+      until: token_bundle.content is defined
+
+    - name: Set fact with decoded token
+      ansible.builtin.set_fact:
+        k3s_cluster_token: "{{ token_bundle.content | b64decode | trim }}"
+
+- name: Join second K3s master (k3s03) over WireGuard
+  hosts: master[1]
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    first_master_wg: "{{ hostvars[groups['master'][0]]['wireguard_ip'].split('/')[0] }}"
+    current_wg: "{{ wireguard_ip.split('/')[0] }}"
+  tags: [master]
+
+  tasks:
+    - name: Check if k3s03 already joined as master
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/k3s.yaml
+      register: master_configured
+
+    - name: Wait for first master API to be responsive
+      ansible.builtin.wait_for:
+        host: "{{ first_master_wg }}"
+        port: 6443
+        delay: 10
+        timeout: 120
+      when: not master_configured.stat.exists
+
+    - name: Join as second control-plane master
+      when: not master_configured.stat.exists
+      ansible.builtin.shell: |
+        set -e
+        export K3S_TOKEN="{{ hostvars['localhost']['k3s_cluster_token'] }}"
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --server=https://{{ first_master_wg }}:6443 \
+          --node-ip={{ current_wg }} \
+          --node-external-ip={{ current_wg }} \
+          --flannel-iface=wg0 \
+          --bind-address={{ current_wg }} \
+          --advertise-address={{ current_wg }} \
+          --tls-san={{ current_wg }} \
+          --etcd-arg=heartbeat-interval=250 \
+          --etcd-arg=election-timeout=2500 \
+          --disable traefik \
+          --disable servicelb \
+          --write-kubeconfig-mode 644 \
+          --write-kubeconfig=/etc/rancher/k3s/k3s.yaml
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+        executable: /bin/bash
+      environment:
+        K3S_TOKEN: "{{ hostvars['localhost']['k3s_cluster_token'] }}"
+      register: join_master
+
+    - name: Ensure k3s service is active on second master
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: true
+      when: not master_configured.stat.exists
+
+    - name: Wait for second master API to be ready
+      ansible.builtin.wait_for:
+        host: "{{ current_wg }}"
+        port: 6443
+        delay: 10
+        timeout: 180
+      when: not master_configured.stat.exists
+
+    - name: Verify second master joined cluster
+      ansible.builtin.shell: |
+        k3s kubectl get nodes -o wide | grep k3s03 || k3s kubectl get nodes
+      changed_when: false
+      register: second_master_verify
+      when: not master_configured.stat.exists
+
+- name: Join worker nodes (k3s02, k3s04) over WireGuard
+  hosts: worker
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    first_master_wg: "{{ hostvars[groups['master'][0]]['wireguard_ip'].split('/')[0] }}"
+    current_wg: "{{ wireguard_ip.split('/')[0] }}"
+  tags: [worker]
+
+  tasks:
+    - name: Check if agent already joined
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/k3s-agent.yaml
+      register: agent_configured
+
+    - name: Wait for master API to be available
+      ansible.builtin.wait_for:
+        host: "{{ first_master_wg }}"
+        port: 6443
+        delay: 5
+        timeout: 120
+      when: not agent_configured.stat.exists
+
+    - name: Install and join K3s agent
+      when: not agent_configured.stat.exists
+      ansible.builtin.shell: |
+        set -e
+        export K3S_TOKEN="{{ hostvars['localhost']['k3s_cluster_token'] }}"
+        export K3S_URL="https://{{ first_master_wg }}:6443"
+        curl -sfL https://get.k3s.io | sh -s - agent \
+          --node-ip={{ current_wg }} \
+          --node-external-ip={{ current_wg }} \
+          --flannel-iface=wg0
+      args:
+        creates: /etc/rancher/k3s/k3s-agent.yaml
+        executable: /bin/bash
+      environment:
+        K3S_TOKEN: "{{ hostvars['localhost']['k3s_cluster_token'] }}"
+        K3S_URL: "https://{{ first_master_wg }}:6443"
+
+    - name: Ensure k3s-agent service is enabled and running
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: started
+        enabled: true
+
+- name: Verify cluster health
+  hosts: master[0]
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tags: [verify]
+
+  tasks:
+    - name: Poll for all nodes to join (up to 5 minutes)
+      ansible.builtin.shell: |
+        set -e
+        EXPECTED={{ groups['k3s_cluster'] | length }}
+        for i in $(seq 1 30); do
+          NODES=$(k3s kubectl get nodes 2>/dev/null | grep -v NAME | wc -l)
+          echo "$(date '+%H:%M:%S') - $NODES/$EXPECTED nodes ready"
+          if [ "$NODES" -ge "$EXPECTED" ]; then
+            echo "SUCCESS: All $NODES nodes joined"
+            break
+          fi
+          sleep 10
+        done
+        echo ""
+        echo "=== NODES ==="
+        k3s kubectl get nodes -o wide
+        echo ""
+        echo "=== SYSTEM PODS ==="
+        k3s kubectl get pods -A
+      changed_when: false
+      register: cluster_status
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        var: cluster_status.stdout_lines

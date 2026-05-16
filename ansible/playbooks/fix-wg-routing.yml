@@ -1,0 +1,77 @@
+---
+# Fix for WireGuard cross-subnet connectivity
+# Known bugs in original:
+# - k3s01's AllowedIPs for k3s02/k3s03 were swapped
+# - k3s03 needs explicit route to 10.0.0.1 via wg0
+# - k3s03's wg0 state goes DOWN after wg-quick restart
+
+- name: Ensure WireGuard interface is UP
+  hosts: k3s_cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Ensure wg0 interface is up
+      ansible.builtin.shell: |
+        ip link show wg0 2>/dev/null | grep -q "state UP" || {
+          ip link del wg0 2>/dev/null || true
+          wg-quick up wg0
+        }
+      changed_when: false
+
+    - name: Add explicit cross-subnet routes for WG peers
+      ansible.builtin.shell: |
+        # k3s01 needs route to k3s03 via wg0
+        ip route add 10.0.0.3/32 dev wg0 2>/dev/null || true
+        ip route add 192.168.11.0/24 via 10.0.0.3 dev wg0 2>/dev/null || true
+      when: inventory_hostname == 'k3s01'
+      changed_when: false
+
+    - name: Add explicit route to k3s01
+      ansible.builtin.shell: |
+        ip route add 10.0.0.1/32 dev wg0 2>/dev/null || true
+      when: inventory_hostname in ['k3s03', 'k3s04']
+      changed_when: false
+
+    - name: Verify WG status
+      ansible.builtin.shell: |
+        wg show wg0 2>&1 | head -20
+      changed_when: false
+
+- name: Fix cross-subnet routing asymmetry
+  hosts: k3s01
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Ensure WG routes persist for cross-subnet peers
+      ansible.builtin.shell: |
+        # Add routes to all cross-subnet WG peers via wg0
+        ip route add 10.0.0.3/32 dev wg0 2>/dev/null || true
+        ip route add 10.0.0.4/32 dev wg0 2>/dev/null || true
+        # Ensure return traffic goes via WG, not gateway
+        ip route change 192.168.11.0/24 via 10.0.0.3 dev wg0 2>/dev/null || \
+        ip route add 192.168.11.0/24 via 10.0.0.3 dev wg0 2>/dev/null || true
+      changed_when: false
+
+    - name: Check current routes
+      ansible.builtin.shell: |
+        ip route show | grep -E "10\.0\.0\.|192\.168\.11\."
+      changed_when: false
+
+- name: Test connectivity from cross-subnet nodes
+  hosts: k3s03
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Test TCP to k3s01:6443
+      ansible.builtin.shell: |
+        timeout 15 bash -c "curl -k https://10.0.0.1:6443/ --connect-timeout 10 2>&1 | head -3" || echo "FAILED_TCP_6443"
+      register: tcp_test
+      changed_when: false
+      failed_when: false
+
+    - name: Show TCP test result
+      ansible.builtin.debug:
+        var: tcp_test.stdout
