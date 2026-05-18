@@ -1,105 +1,160 @@
 ---
-# MetalLB Installation Playbook for K3s
-# Usage: ansible-playbook playbooks/metallb.yml
+# MetalLB Installation with Site-Specific IP Pools for K3s
+# Site 1: k3s01/k3s02 (192.168.1.200-250)
+# Site 2: k3s03/k3s04 (192.168.11.200-250)
+# Usage: ansible-playbook playbooks/metallb.yml -v
 
-- name: Install MetalLB on K3s Cluster
-  hosts: master
+- name: Install MetalLB on K3s Cluster (Site-Specific)
+  hosts: k3s_cluster
   become: yes
   gather_facts: yes
   vars:
     metallb_version: v0.14.5
-    ip_pool_start: 192.168.1.200
-    ip_pool_end: 192.168.1.250
+    # Site 1 IP pool (192.168.1.x)
+    site1_pool_start: 192.168.1.200
+    site1_pool_end: 192.168.1.250
+    # Site 2 IP pool (192.168.11.x)
+    site2_pool_start: 192.168.11.200
+    site2_pool_end: 192.168.11.250
 
   tasks:
-    - name: Apply MetalLB manifests (first master only)
+    # ── Node labeling ────────────────────────────────────────
+    - name: Label site1 nodes (k3s01, k3s02)
+      ansible.builtin.shell:
+        cmd: kubectl label node {{ item }} site=site1 --overwrite
+      loop:
+        - k3s01
+        - k3s02
+      when: inventory_hostname == groups['k3s_cluster'][0]
+
+    - name: Label site2 nodes (k3s03, k3s04)
+      ansible.builtin.shell:
+        cmd: kubectl label node {{ item }} site=site2 --overwrite
+      loop:
+        - k3s03
+        - k3s04
+      when: inventory_hostname == groups['k3s_cluster'][0]
+
+    # ── Install MetalLB ──────────────────────────────────────
+    - name: Apply MetalLB native manifest (first master only)
       ansible.builtin.shell:
         cmd: kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/config/manifests/metallb-native.yaml --validate=false
       register: metallb_install
       changed_when: "'created' in metallb_install.stdout or 'configured' in metallb_install.stdout"
       when: inventory_hostname == groups['master'][0]
 
-    - name: Wait for MetalLB pods to be ready
+    - name: Wait for MetalLB pods (controller + speaker) to be ready
       ansible.builtin.shell:
-        cmd: kubectl get pods -n metallb-system -o jsonpath='{.items[*].status.phase}'
+        cmd: >
+          kubectl get pods -n metallb-system -o jsonpath='{range .items[*]}{.metadata.name}{":"}{.status.phase}{" "}{end}'
       register: pod_status
-      until: "'Running Running' in pod_status.stdout or pod_status.stdout == 'Running'"
+      until: >
+        (pod_status.stdout | regex_search('controller.*Running')) and
+        (pod_status.stdout | regex_search('speaker.*Running'))
       retries: 30
       delay: 5
       changed_when: false
       when: inventory_hostname == groups['master'][0]
 
-    - name: Create IPAddressPool config (first master only)
-      ansible.builtin.copy:
-        dest: /tmp/metallb-config.yaml
-        content: |
+    # ── Site-specific IP pools ──────────────────────────────
+    - name: Apply Site 1 IPAddressPool (first master only)
+      ansible.builtin.shell:
+        cmd: |
+          kubectl apply -f - <<EOF
           apiVersion: metallb.io/v1beta1
           kind: IPAddressPool
           metadata:
-            name: default-pool
+            name: site1-pool
             namespace: metallb-system
           spec:
             addresses:
-            - {{ ip_pool_start }}-{{ ip_pool_end }}
+            - {{ site1_pool_start }}-{{ site1_pool_end }}
             autoAssign: true
-          ---
+          EOF
+      register: pool1
+      changed_when: "'created' in pool1.stdout"
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Apply Site 2 IPAddressPool (first master only)
+      ansible.builtin.shell:
+        cmd: |
+          kubectl apply -f - <<EOF
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: site2-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+            - {{ site2_pool_start }}-{{ site2_pool_end }}
+            autoAssign: true
+          EOF
+      register: pool2
+      changed_when: "'created' in pool2.stdout"
+      when: inventory_hostname == groups['master'][0]
+
+    # ── Site-specific L2 Advertisements ─────────────────────
+    # Each site only advertises IPs from its own pool
+    # nodeSelector ensures Site1 nodes handle Site1 IPs, Site2 nodes handle Site2 IPs
+    - name: Apply Site 1 L2Advertisement (first master only)
+      ansible.builtin.shell:
+        cmd: |
+          kubectl apply -f - <<EOF
           apiVersion: metallb.io/v1beta1
           kind: L2Advertisement
           metadata:
-            name: l2-adv
+            name: site1-l2
             namespace: metallb-system
           spec:
             ipAddressPools:
-            - default-pool
+            - site1-pool
+            nodeSelectors:
+            - matchLabels:
+                site: site1
+          EOF
+      register: l2adv1
+      changed_when: "'created' in l2adv1.stdout"
       when: inventory_hostname == groups['master'][0]
 
-    - name: Delete MetalLB webhook if stuck (workaround)
+    - name: Apply Site 2 L2Advertisement (first master only)
+      ansible.builtin.shell:
+        cmd: |
+          kubectl apply -f - <<EOF
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: site2-l2
+            namespace: metallb-system
+          spec:
+            ipAddressPools:
+            - site2-pool
+            nodeSelectors:
+            - matchLabels:
+                site: site2
+          EOF
+      register: l2adv2
+      changed_when: "'created' in l2adv2.stdout"
+      when: inventory_hostname == groups['master'][0]
+
+    # ── Cleanup stale default config ─────────────────────────
+    - name: Delete webhook if stuck (first master only)
       ansible.builtin.shell:
         cmd: kubectl delete validatingwebhookconfiguration metallb-webhook-configuration --ignore-not-found=true
       changed_when: false
       when: inventory_hostname == groups['master'][0]
 
-    - name: Apply MetalLB IPAddressPool (first master only)
+    # ── Verify ───────────────────────────────────────────────
+    - name: Verify MetalLB installation and config (first master only)
       ansible.builtin.shell:
-        cmd: |
-          kubectl apply -f - <<EOF
-          apiVersion: metallb.io/v1beta1
-          kind: IPAddressPool
-          metadata:
-            name: default-pool
-            namespace: metallb-system
-          spec:
-            addresses:
-            - {{ ip_pool_start }}-{{ ip_pool_end }}
-            autoAssign: true
-          EOF
-      register: metallb_config
-      changed_when: "'created' in metallb_config.stdout"
-      when: inventory_hostname == groups['master'][0]
-
-    - name: Apply MetalLB L2Advertisement (first master only)
-      ansible.builtin.shell:
-        cmd: |
-          kubectl apply -f - <<EOF
-          apiVersion: metallb.io/v1beta1
-          kind: L2Advertisement
-          metadata:
-            name: l2-adv
-            namespace: metallb-system
-          spec:
-            ipAddressPools:
-            - default-pool
-          EOF
-      register: l2adv
-      changed_when: "'created' in l2adv.stdout"
-      when: inventory_hostname == groups['master'][0]
-
-    - name: Verify MetalLB installation
-      ansible.builtin.shell:
-        cmd: kubectl get pods -n metallb-system && kubectl get ipaddresspools -A
-      register: verification
+        cmd: >
+          echo "=== PODS ===" && kubectl get pods -n metallb-system &&
+          echo "=== IP POOLS ===" && kubectl get ipaddresspools -A &&
+          echo "=== L2 ADVERTISEMENTS ===" && kubectl get L2Advertisement -A &&
+          echo "=== NODE LABELS ===" && kubectl get nodes -o wide
+      register: verify
       changed_when: false
+      when: inventory_hostname == groups['master'][0]
 
-    - name: Display installation results
+    - name: Display verification results
       ansible.builtin.debug:
-        var: verification.stdout_lines
+        var: verify.stdout_lines
