@@ -1,0 +1,388 @@
+# Create ConfigMaps for Traccar config files
+# traccar-conf ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traccar-conf
+  namespace: traccar
+data:
+  traccar.xml: |
+    <?xml version='1.0' encoding='UTF-8'?>
+    <!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+    <properties>
+        <entry key='config.default'>./conf/default.xml</entry>
+        <entry key='database.driver'>org.postgresql.Driver</entry>
+        <entry key='database.url'>jdbc:postgresql://192.168.1.239:5434/traccar</entry>
+        <entry key='database.user'>traccar</entry>
+        <entry key='database.password'>dbadmin@ubiqtrac2020</entry>
+        <entry key='status.timeout'>900</entry>
+        <entry key='filter.skipAttributes.enable'>true</entry>
+        <entry key='filter.skipAttributes'>alarm,ignition,result</entry>
+        <entry key='config.insert0'>./conf/insert.xml</entry>
+        <entry key='gps103.port'>5001</entry>
+        <entry key='meiligao.port'>5009</entry>
+        <entry key='jt600.port'>5014</entry>
+        <entry key='meitrack.port'>5020</entry>
+        <entry key='gt06.port'>5023</entry>
+        <entry key='huasheng.port'>5111</entry>
+        <entry key='jt808.port'>5300</entry>
+        <entry key='at.port'>5301</entry>
+        <entry key='teltonika.port'>5027</entry>
+        <entry key='web.enable'>true</entry>
+        <entry key='web.port'>8082</entry>
+        <entry key='web.path'>./web</entry>
+        <entry key='forward.enable'>true</entry>
+        <entry key='forward.url'>http://137.59.109.247:8888/tbgw</entry>
+        <entry key='forward.json'>true</entry>
+        <entry key="event.forward.enable">true</entry>
+        <entry key='event.forward.url'>http://137.59.109.247:8888/tbgw</entry>
+    </properties>
+  default.xml: |
+    <?xml version='1.0' encoding='UTF-8'?>
+    <!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+    <properties>
+        <entry key='media.domain'>https://login3.ubiqtrac.com.my:8443</entry>
+        <entry key='web.enable'>true</entry>
+        <entry key='web.port'>8082</entry>
+        <entry key='web.path'>./web</entry>
+        <entry key='web.cacheControl'>max-age=3600,public</entry>
+        <entry key='geocoder.enable'>false</entry>
+        <entry key='logger.enable'>true</entry>
+        <entry key='logger.level'>info</entry>
+        <entry key='logger.console'>true</entry>
+        <entry key='logger.file'>./logs/tracker-server.log</entry>
+        <entry key='logger.rotate'>true</entry>
+        <entry key='logger.fullStackTraces'>true</entry>
+        <entry key='filter.enable'>true</entry>
+        <entry key='filter.future'>86400</entry>
+        <entry key='event.enable'>true</entry>
+        <entry key='event.ignoreDuplicateAlerts'>true</entry>
+        <entry key='processing.computedAttributes.enable'>true</entry>
+        <entry key='processing.engineHours.enable'>true</entry>
+        <entry key='media.path'>media</entry>
+        <entry key='notificator.types'>web,mail</entry>
+        <entry key='commands.queueing'>true</entry>
+        <entry key='database.ignoreUnknown'>false</entry>
+        <entry key='database.registerUnknown'>true</entry>
+        <entry key='database.generateQueries'>true</entry>
+        <entry key='database.changelog'>./schema/changelog-master.xml</entry>
+        <entry key='database.loginUser'>
+            SELECT * FROM tc_users WHERE email = :email OR login = :email
+        </entry>
+        <entry key='database.selectPositions'>
+            SELECT * FROM tc_positions WHERE deviceId = :deviceId AND fixTime BETWEEN :from AND :to ORDER BY fixTime
+        </entry>
+        <entry key='database.selectLatestPositions'>
+            SELECT tc_positions.* FROM tc_positions INNER JOIN tc_devices ON tc_positions.id = tc_devices.positionid;
+        </entry>
+        <entry key='database.updateLatestPosition'>
+            UPDATE tc_devices SET positionId = :id WHERE id = :deviceId
+        </entry>
+        <entry key='database.selectEvents'>
+            SELECT * FROM tc_events WHERE deviceId = :deviceId AND serverTime BETWEEN :from AND :to ORDER BY serverTime
+        </entry>
+        <entry key='database.deletePositions'>
+            DELETE FROM tc_positions WHERE serverTime &lt; :serverTime AND id NOT IN (SELECT positionId FROM tc_devices WHERE positionId IS NOT NULL)
+        </entry>
+        <entry key='database.deleteEvents'>
+            DELETE FROM tc_events WHERE serverTime &lt; :serverTime
+        </entry>
+        <entry key='database.selectStatistics'>
+            SELECT * FROM tc_statistics WHERE captureTime BETWEEN :from AND :to ORDER BY captureTime
+        </entry>
+        <entry key='xexun.extended'>false</entry>
+    </properties>
+  insert.xml: |
+    <?xml version='1.0' encoding='UTF-8'?>
+    <!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+    <properties>
+        <entry key='database.insertEvent'>
+            INSERT INTO tc_events (type, serverTime, deviceId, positionId, geofenceId, attributes, maintenanceId)
+            VALUES (:type, :serverTime, :deviceId, :positionId, :geofenceId, :attributes, :maintenanceId);
+
+            SELECT :type, :serverTime, :deviceId, :positionId, :attributes
+            INTO @type, @serverTime, @deviceId, @positionId, @eventAttributes;
+
+            START TRANSACTION;
+            SET @network = NULL, @course = NULL, @attributes = NULL, @protocol = NULL, @longitude = NULL, @latitude = NULL, @valid = NULL, @fixTime = NULL, @speed = NULL, @accuracy = NULL;
+            SET @internalVoltage = NULL, @externalVoltage = NULL, @eventType = NULL;
+            SET @knotsToKph             = 1.852;
+            SET @abnormalHdop           = 12.2;
+            SET @meiligaoWorkingVolt    = 6;
+            SET @meiligaoAnalog10Bit    = 1024;
+
+            SELECT uniqueId FROM tc_devices WHERE id = @deviceId INTO @deviceImei;
+
+            SELECT IF(@type = 'rfid', 'DriverId', @eventType) INTO @eventType;
+            SELECT IF(@type = 'rfid', JSON_EXTRACT(@eventAttributes, "$.driverUniqueId"), NULL) INTO @driverId;
+            SELECT IF(@driverId IS NOT NULL, SUBSTRING_INDEX(@driverId, '"', 2), NULL) INTO @driverId;
+            SELECT IF(@driverId IS NOT NULL, SUBSTRING_INDEX(@driverId, '"', -1), NULL) INTO @driverId;
+
+            SELECT IF(@type = 'alarm', JSON_EXTRACT(@eventAttributes, "$.alarm"), NULL) INTO @alarm;
+            SELECT IF(@alarm IS NOT NULL, SUBSTRING_INDEX(@alarm, '"', 2), NULL) INTO @alarm;
+            SELECT IF(@alarm IS NOT NULL, SUBSTRING_INDEX(@alarm, '"', -1), NULL) INTO @alarm;
+            SELECT IF(@alarm IS NOT NULL,
+            CASE @alarm
+            WHEN 'sos' THEN 'SOS Button Pressed Alarm'
+            WHEN 'door' THEN 'Door Open'
+            WHEN 'lowBattery' THEN 'LowBatteryAlarm'
+            WHEN 'overspeed' THEN 'Speed Alarm'
+            WHEN 'movement' THEN 'Towed Alarm'
+            WHEN 'accident' THEN 'Accident Buffer'
+            WHEN 'powerOn' THEN 'PowerOn'
+            WHEN 'powerOff' THEN 'PowerOff'
+            WHEN 'powerCut' THEN 'External Power Alarm'
+            WHEN 'gpsAntennaCut' THEN 'Gps Antenna Disconnected'
+            WHEN 'hardBraking' THEN 'Harsh Braking Alarm'
+            WHEN 'footBrake' THEN 'Harsh Braking Alarm'
+            WHEN 'hardAcceleration' THEN 'Harsh Acceleration Alarm'
+            WHEN 'hardDeceleration' THEN 'Harsh Deceleration Alarm'
+            WHEN 'fuelLeak' THEN 'Fuel Level Alarm'
+            WHEN 'temperature' THEN 'Temperature Out Of Range Alarm'
+            WHEN 'shock' THEN 'Vibration Alarm'
+            WHEN 'bonnet' THEN 'Bonnet Alarm'
+            WHEN 'fault' THEN 'Fault Alarm'
+            WHEN 'idle' THEN 'Idle Alarm'
+            WHEN 'fatigueDriving' THEN 'Fatigue Driving'
+            WHEN 'hardCornering' THEN 'Harsh Corner Alarm'
+            WHEN 'tow' THEN 'Towed Alarm'
+            WHEN 'vibration' THEN 'Vibration Alarm'
+            WHEN 'geofence' THEN 'Geofence Alarm'
+            WHEN 'geofenceEnter' THEN 'GeofenceEnter'
+            WHEN 'geofenceExit' THEN 'GeofenceExit'
+            WHEN 'tampering' THEN 'Tampering Alarm'
+            WHEN 'fallDown' THEN 'Fall Down Alarm'
+            WHEN 'gpsSignalLost' THEN 'Gps Signal Lost Alarm'
+            WHEN 'gpsSignalRecovery' THEN 'Gps Signal Recovery Alarm'
+            WHEN 'gpsFirstFixNotice' THEN 'Gps First Fix Notice'
+            WHEN 'simChangeNotice' THEN 'Sim Change Notice'
+            WHEN 'airplaneMode' THEN 'Airplane Mode'
+            WHEN 'soundControl' THEN 'Sound Control'
+            WHEN 'pseudoBaseStation' THEN 'Pseudo Base Station'
+            WHEN 'openCover' THEN 'Open Cover Alarm'
+            WHEN 'sleepEnter' THEN 'Enter Sleep Mode Alarm'
+            WHEN 'sleepExit' THEN 'Exit Sleep Mode Alarm'
+            WHEN 'restart' THEN 'Device Restart'
+            WHEN 'simOverTrafficLimit' THEN 'Sim Over Traffic Limit'
+            WHEN 'faultCamera1' THEN 'Fault Camera1'
+            WHEN 'faultCamera2' THEN 'Fault Camera2'
+            WHEN 'cardUnidentifiable' THEN 'Card Unidentifiable'
+            WHEN 'noUsbCamera' THEN 'No Usb Camera'
+            WHEN 'landTransport' THEN 'Land Transport'
+            WHEN 'waterborneTransport' THEN 'Waterborne Transport'
+            WHEN 'driverInCall' THEN 'Driver In Call'
+            WHEN 'driverSmoking' THEN 'Driver Smoking'
+            WHEN 'driverDistracted' THEN 'Driver Distracted'
+            WHEN 'driverStrange' THEN 'Driver Strange'
+            WHEN 'driverChanged' THEN 'Driver Changed'
+            ELSE @alarm
+            END, @eventType) INTO @eventType;
+
+            SELECT IF(@type != 'driverChanged' AND @type != 'alarm',
+            CASE @type
+            WHEN 'driverChanged' THEN 'DriverChanged'
+            WHEN 'deviceOnline' THEN 'Online'
+            WHEN 'deviceOffline' THEN 'Offline'
+            WHEN 'deviceMoving' THEN 'Idling Stop'
+            WHEN 'deviceStopped' THEN 'Idling Start'
+            WHEN 'deviceOverspeed' THEN 'Speed Alarm'
+            WHEN 'deviceFuelDrop' THEN 'Fuel Level Alarm'
+            WHEN 'ignitionOn' THEN 'Ignition On'
+            WHEN 'ignitionOff' THEN 'Ignition Off'
+            WHEN 'driverChanged' THEN 'DriverId'
+            WHEN 'commandResult' THEN 'CommandResult'
+            WHEN 'deviceUnknown' THEN 'Offline'
+            WHEN 'geofenceEnter' THEN 'GeofenceEnter'
+            WHEN 'geofenceExit' THEN 'GeofenceExit'
+            WHEN 'textMessage' THEN 'TextMessage'
+            WHEN 'maintenance' THEN 'Maintenance'
+            WHEN 'immobilizeOn' THEN 'Immobilize On'
+            WHEN 'immobilizeOff' THEN 'Immobilize Off'
+            END, @eventType) INTO @eventType;
+
+            SELECT network, course, attributes, protocol, longitude, latitude, valid, fixTime, speed, accuracy
+            INTO @network, @course, @attributes, @protocol, @longitude, @latitude, @valid, @fixTime, @speed, @accuracy
+            FROM tc_positions WHERE @positionId IS NOT NULL AND id = @positionId;
+
+            SELECT ROUND(@speed * @knotsToKph, 2) INTO @speed;
+            SELECT JSON_EXTRACT(@attributes, "$.distance") INTO @distance;
+            SELECT JSON_EXTRACT(@attributes, "$.rssi") INTO @gsmSignal;
+            SELECT JSON_EXTRACT(@attributes, "$.fuel") INTO @fuel;
+            SELECT JSON_EXTRACT(@attributes, "$.temp1") INTO @temperature;
+            SELECT JSON_EXTRACT(@attributes, "$.power") INTO @power;
+            SELECT JSON_EXTRACT(@attributes, "$.battery") INTO @battery;
+
+            SELECT IF(@distance IS NOT NULL AND @distance != 0, @distance / 1000, 0) INTO @distance;
+            SELECT CASE JSON_EXTRACT(@attributes, "$.ignition") WHEN 'true' THEN 1 ELSE 0 END INTO @ignition;
+            SELECT CASE JSON_EXTRACT(@attributes, "$.blocked") WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE NULL END INTO @immobilized;
+
+            SELECT JSON_EXTRACT(JSON_EXTRACT(@network, "$.cellTowers"), "$[0]") INTO @cellTowers;
+            SELECT JSON_EXTRACT(@cellTowers, "$.locationAreaCode") INTO @locationAreaCode;
+
+            SELECT IF(@protocol = 'meiligao' AND @accuracy = @abnormalHdop, 0, @accuracy) INTO @accuracy;
+            SELECT IF(@protocol = 'meiligao', JSON_EXTRACT(@attributes, "$.adc1") * @meiligaoWorkingVolt / @meiligaoAnalog10Bit, NULL) INTO @adcVoltage1;
+            SELECT IF(@protocol = 'meiligao', JSON_EXTRACT(@attributes, "$.adc2") * @meiligaoWorkingVolt / @meiligaoAnalog10Bit, NULL) INTO @adcVoltage2;
+            SELECT IF(@protocol = 'meiligao' AND @adcVoltage1 IS NOT NULL AND @adcVoltage2 IS NOT NULL AND 5 > @adcVoltage1 AND @adcVoltage2 > 5, @adcVoltage1, @internalVoltage) INTO @internalVoltage;
+            SELECT IF(@protocol = 'meiligao' AND @adcVoltage1 IS NOT NULL AND @adcVoltage2 IS NOT NULL AND 5 > @adcVoltage1 AND @adcVoltage2 > 5, @adcVoltage2, @externalVoltage) INTO @externalVoltage;
+
+            SELECT IF(@protocol = 'gt06', CASE @gsmSignal WHEN 1 THEN 7 WHEN 2 THEN 15 WHEN 3 THEN 23 WHEN 4 THEN 31 ELSE NULL END, @gsmSignal) INTO @gsmSignal;
+            SELECT IF(@protocol = 'gt06' AND @accuracy = 0, ROUND(12 / JSON_EXTRACT(@attributes, "$.sat"), 2), @accuracy) INTO @accuracy;
+            SELECT IF(@protocol = 'huasheng' AND 5 > @power, @power, @internalVoltage) INTO @internalVoltage;
+            SELECT IF(@protocol = 'huasheng' AND @power > 5, @power, @externalVoltage) INTO @externalVoltage;
+            SELECT IF(@accuracy != 0, @accuracy, NULL) INTO @hdop;
+            SELECT IF(@internalVoltage IS NOT NULL, @internalVoltage, @battery) INTO @internalVoltage;
+
+            CALL `vts_data`.InsertCommand9(@deviceImei, @driverId, @serverTime, @eventType, @valid, @hdop, @fixTime, @latitude,
+            @longitude, @speed, NULL, @course, @distance, @gsmSignal, NULL, @ignition, NULL, NULL, @fuel, NULL,
+            @temperature, '1', @immobilized, NULL, ROUND(@externalVoltage, 2), ROUND(@internalVoltage, 2), NULL, @locationAreaCode);
+            COMMIT;
+        </entry>
+        <entry key='database.insertPosition'>
+            INSERT INTO tc_positions (address, network, serverTime, course, attributes, deviceTime, protocol, longitude, deviceId, latitude, valid, fixTime, speed, altitude, accuracy)
+            VALUES (:address, :network, :serverTime, :course, :attributes, :deviceTime, :protocol, :longitude, :deviceId, :latitude, :valid, :fixTime, :speed, :altitude, :accuracy);
+
+            SELECT :network, :serverTime, :course, :attributes, :protocol, :longitude, :deviceId, :latitude, :valid, :fixTime, :speed, :accuracy
+            INTO @network, @serverTime, @course, @attributes, @protocol, @longitude, @deviceId, @latitude, @valid, @fixTime, @speed, @accuracy;
+
+            START TRANSACTION;
+            SET @internalVoltage = NULL, @externalVoltage = NULL;
+            SET @knotsToKph             = 1.852;
+            SET @abnormalHdop           = 12.2;
+            SET @meiligaoWorkingVolt    = 6;
+            SET @meiligaoAnalog10Bit    = 1024;
+
+            SELECT uniqueId FROM tc_devices WHERE id = @deviceId INTO @deviceImei;
+
+            SELECT ROUND(@speed * @knotsToKph, 2) INTO @speed;
+            SELECT JSON_EXTRACT(@attributes, "$.distance") INTO @distance;
+            SELECT JSON_EXTRACT(@attributes, "$.rssi") INTO @gsmSignal;
+            SELECT JSON_EXTRACT(@attributes, "$.fuel") INTO @fuel;
+            SELECT JSON_EXTRACT(@attributes, "$.temp1") INTO @temperature;
+            SELECT JSON_EXTRACT(@attributes, "$.power") INTO @power;
+            SELECT JSON_EXTRACT(@attributes, "$.battery") INTO @battery;
+
+            SELECT IF(@distance IS NOT NULL AND @distance != 0, @distance / 1000, 0) INTO @distance;
+            SELECT CASE JSON_EXTRACT(@attributes, "$.ignition") WHEN 'true' THEN 1 ELSE 0 END INTO @ignition;
+            SELECT CASE JSON_EXTRACT(@attributes, "$.blocked") WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE NULL END INTO @immobilized;
+
+            SELECT JSON_EXTRACT(JSON_EXTRACT(@network, "$.cellTowers"), "$[0]") INTO @cellTowers;
+            SELECT JSON_EXTRACT(@cellTowers, "$.locationAreaCode") INTO @locationAreaCode;
+
+            SELECT IF(@protocol = 'meiligao' AND @accuracy = @abnormalHdop, 0, @accuracy) INTO @accuracy;
+            SELECT IF(@protocol = 'meiligao', JSON_EXTRACT(@attributes, "$.adc1") * @meiligaoWorkingVolt / @meiligaoAnalog10Bit, NULL) INTO @adcVoltage1;
+            SELECT IF(@protocol = 'meiligao', JSON_EXTRACT(@attributes, "$.adc2") * @meiligaoWorkingVolt / @meiligaoAnalog10Bit, NULL) INTO @adcVoltage2;
+            SELECT IF(@protocol = 'meiligao' AND @adcVoltage1 IS NOT NULL AND @adcVoltage2 IS NOT NULL AND 5 > @adcVoltage1 AND @adcVoltage2 > 5, @adcVoltage1, @internalVoltage) INTO @internalVoltage;
+            SELECT IF(@protocol = 'meiligao' AND @adcVoltage1 IS NOT NULL AND @adcVoltage2 IS NOT NULL AND 5 > @adcVoltage1 AND @adcVoltage2 > 5, @adcVoltage2, @externalVoltage) INTO @externalVoltage;
+
+            SELECT ASS_ID FROM ubiqtrac.vts_assets INNER JOIN ubiqtrac.vts_device ON ASS_DVC_ID = DVC_ID WHERE DVC_SERIAL_NO = @deviceImei AND DVC_DELETED = 'N' AND ASS_DELETED = 'N' INTO @assId;
+            SELECT calibrate.R INTO @result FROM (SELECT FRC_PERCENTAGE, FRC_VALUE, abs(FRC_VALUE - @adcVoltage1 * 1000) as d, ((FRC_PERCENTAGE/FRC_VALUE * abs(FRC_VALUE - @adcVoltage1 * 1000))+FRC_PERCENTAGE) as R from ubiqtrac.vts_fuel_rod_calibrate where FRC_DELETED ='N' AND FRC_ASS_ID = @assId and 2 > CEIL(((FRC_PERCENTAGE/FRC_VALUE * abs(FRC_VALUE - @adcVoltage1 * 1000))+FRC_PERCENTAGE) / 100) order by d limit 1) AS calibrate;
+            SELECT IF(@protocol = 'meiligao' AND @result IS NOT NULL, round(@result, 2), NULL) INTO @fuel;
+
+            SELECT IF(@protocol = 'gt06' OR @protocol = 'at', CASE @gsmSignal WHEN 1 THEN 7 WHEN 2 THEN 15 WHEN 3 THEN 23 WHEN 4 THEN 31 ELSE NULL END, @gsmSignal) INTO @gsmSignal;
+            SELECT IF(@protocol = 'gt06' AND @accuracy = 0, ROUND(12 / JSON_EXTRACT(@attributes, "$.sat"), 2), @accuracy) INTO @accuracy;
+            SELECT IF(@protocol = 'gt06', JSON_EXTRACT(@attributes, "$.fuel"), NULL) INTO @fuel;
+            SELECT IF(@protocol = 'huasheng' AND 5 > @power, @power, @internalVoltage) INTO @internalVoltage;
+            SELECT IF(@protocol = 'huasheng' AND @power > 5, @power, @externalVoltage) INTO @externalVoltage;
+            SELECT IF(@accuracy != 0, @accuracy, NULL) INTO @hdop;
+            SELECT IF(@internalVoltage IS NOT NULL, @internalVoltage, @battery) INTO @internalVoltage;
+
+            CALL `vts_data`.InsertCommand9(@deviceImei, NULL, @serverTime, 'Gps', @valid, @hdop, @fixTime, @latitude,
+            @longitude, @speed, NULL, @course, @distance, @gsmSignal, NULL, @ignition, NULL, NULL, @fuel, NULL,
+            @temperature, '0', @immobilized, NULL, ROUND(@externalVoltage, 2), ROUND(@internalVoltage, 2), NULL, @locationAreaCode);
+            COMMIT;
+        </entry>
+    </properties>
+---
+# Traccar Deployment using ConfigMap for config
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traccar
+  namespace: traccar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traccar
+  template:
+    metadata:
+      labels:
+        app: traccar
+    spec:
+      hostNetwork: true
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+      containers:
+        - name: traccar
+          image: traccar/traccar:5.9
+          ports:
+            - containerPort: 8082
+              hostPort: 8082
+            - containerPort: 5001
+              hostPort: 5001
+            - containerPort: 5009
+              hostPort: 5009
+            - containerPort: 5014
+              hostPort: 5014
+            - containerPort: 5020
+              hostPort: 5020
+            - containerPort: 5023
+              hostPort: 5023
+            - containerPort: 5027
+              hostPort: 5027
+            - containerPort: 5111
+              hostPort: 5111
+            - containerPort: 5300
+              hostPort: 5300
+            - containerPort: 5301
+              hostPort: 5301
+          volumeMounts:
+            - name: traccar-data
+              mountPath: /opt/traccar/data
+            - name: traccar-logs
+              mountPath: /opt/traccar/logs
+            - name: traccar-conf
+              mountPath: /opt/traccar/conf
+            - name: traccar-web
+              mountPath: /opt/traccar/web
+          livenessProbe:
+            httpGet:
+              path: /api/server
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/server
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+      volumes:
+        - name: traccar-data
+          persistentVolumeClaim:
+            claimName: traccar-data
+        - name: traccar-logs
+          persistentVolumeClaim:
+            claimName: traccar-logs
+        - name: traccar-conf
+          configMap:
+            name: traccar-conf
+            items:
+              - key: traccar.xml
+                path: traccar.xml
+              - key: default.xml
+                path: default.xml
+              - key: insert.xml
+                path: insert.xml
+        - name: traccar-web
+          persistentVolumeClaim:
+            claimName: traccar-web

@@ -1,0 +1,107 @@
+# Traccar deployment with config bootstrap via init container
+# Init container copies config from the original NFS location to PVCs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traccar
+  namespace: traccar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traccar
+  template:
+    metadata:
+      labels:
+        app: traccar
+    spec:
+      hostNetwork: true
+      initContainers:
+        - name: bootstrap-config
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Copying config files..."
+              cp /src/conf/traccar.xml /mnt/conf/traccar.xml
+              cp /src/conf/default.xml /mnt/conf/default.xml
+              cp /src/conf/insert.xml /mnt/conf/insert.xml
+              
+              # Update database URL from localhost to actual host IP
+              sed -i 's|localhost:5434|192.168.1.239:5434|g' /mnt/conf/traccar.xml
+              
+              echo "Config files copied and updated"
+              ls -la /mnt/conf/
+          volumeMounts:
+            - name: traccar-conf
+              mountPath: /mnt/conf
+            - name: config-source
+              mountPath: /src/conf
+      containers:
+        - name: traccar
+          image: traccar/traccar:5.9
+          ports:
+            - containerPort: 8082
+              hostPort: 8082
+            - containerPort: 5001
+              hostPort: 5001
+            - containerPort: 5009
+              hostPort: 5009
+            - containerPort: 5014
+              hostPort: 5014
+            - containerPort: 5020
+              hostPort: 5020
+            - containerPort: 5023
+              hostPort: 5023
+            - containerPort: 5027
+              hostPort: 5027
+            - containerPort: 5111
+              hostPort: 5111
+            - containerPort: 5300
+              hostPort: 5300
+            - containerPort: 5301
+              hostPort: 5301
+          volumeMounts:
+            - name: traccar-data
+              mountPath: /opt/traccar/data
+            - name: traccar-logs
+              mountPath: /opt/traccar/logs
+            - name: traccar-conf
+              mountPath: /opt/traccar/conf
+            - name: traccar-web
+              mountPath: /opt/traccar/web
+          livenessProbe:
+            httpGet:
+              path: /api/server
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/server
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+      volumes:
+        - name: traccar-data
+          persistentVolumeClaim:
+            claimName: traccar-data
+        - name: traccar-logs
+          persistentVolumeClaim:
+            claimName: traccar-logs
+        - name: traccar-conf
+          persistentVolumeClaim:
+            claimName: traccar-conf
+        - name: traccar-web
+          persistentVolumeClaim:
+            claimName: traccar-web
+        - name: config-source
+          hostPath:
+            path: /mnt/nfs/traccar/conf
+            type: Directory

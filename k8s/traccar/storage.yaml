@@ -1,0 +1,82 @@
+---
+# Storage class manifest for traccar
+# Longhorn supports RWX (ReadWriteMany) - use for multi-node access
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: traccar-storage
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+parameters:
+  numberOfReplicas: "2"
+  staleReplicaTimeout: "2880"
+  fromBackup: ""
+  fsType: "ext4"
+  volumeAccessMode: readWriteMany
+---
+# PVC for traccar data directory
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-data
+  namespace: traccar
+  labels:
+    app: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: traccar-storage
+  resources:
+    requests:
+      storage: 10Gi
+---
+# PVC for traccar logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-logs
+  namespace: traccar
+  labels:
+    app: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: traccar-storage
+  resources:
+    requests:
+      storage: 5Gi
+---
+# PVC for traccar configuration
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-conf
+  namespace: traccar
+  labels:
+    app: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: traccar-storage
+  resources:
+    requests:
+      storage: 1Gi
+---
+# PVC for traccar web interface
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-web
+  namespace: traccar
+  labels:
+    app: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: traccar-storage
+  resources:
+    requests:
+      storage: 1Gi

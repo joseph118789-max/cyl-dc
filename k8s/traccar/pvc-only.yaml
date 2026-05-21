@@ -1,0 +1,63 @@
+# Traccar on k3s - using Longhorn storage
+# Phase 1: Create PVCs first (must be Bound before deploying pod)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: traccar
+---
+# Data volume
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-data
+  namespace: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi
+---
+# Logs volume
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-logs
+  namespace: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
+# Config volume (read-only)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-conf
+  namespace: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Web volume
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traccar-web
+  namespace: traccar
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi

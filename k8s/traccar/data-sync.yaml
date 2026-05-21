@@ -1,0 +1,81 @@
+---
+# Job to sync existing traccar data from NFS to Longhorn PVCs
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: traccar-data-sync
+  namespace: traccar
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: data-sync
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Syncing traccar data from NFS to PVCs..."
+              # Mount NFS (this container runs on a node with NFS access potentially)
+              # Actually we need to mount from the original traccar location
+              # The nfs mount is at /mnt/nfs/traccar on the current host
+              # But k3s pods may not have access to that NFS directly
+              
+              # For now, we'll use the NFS clientProvisioner or access via node
+              # Let's copy existing data to the PVC
+              if [ -d /mnt/nfs/traccar/data ]; then
+                cp -r /mnt/nfs/traccar/data/* /opt/traccar/data/ 2>/dev/null || echo "No data to copy"
+              fi
+              if [ -d /mnt/nfs/traccar/logs ]; then
+                cp -r /mnt/nfs/traccar/logs/* /opt/traccar/logs/ 2>/dev/null || echo "No logs to copy"
+              fi
+              if [ -d /mnt/nfs/traccar/conf ]; then
+                cp /mnt/nfs/traccar/conf/*.xml /opt/traccar/conf/ 2>/dev/null || echo "No conf to copy"
+              fi
+              if [ -d /mnt/nfs/traccar/web ]; then
+                cp -r /mnt/nfs/traccar/web/* /opt/traccar/web/ 2>/dev/null || echo "No web to copy"
+              fi
+              echo "Data sync complete"
+          volumeMounts:
+            - name: traccar-data
+              mountPath: /opt/traccar/data
+            - name: traccar-logs
+              mountPath: /opt/traccar/logs
+            - name: traccar-conf
+              mountPath: /opt/traccar/conf
+            - name: traccar-web
+              mountPath: /opt/traccar/web
+            - name: nfs-traccar
+              mountPath: /mnt/nfs/traccar
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+      containers:
+        - name: wait
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for data sync to complete..."
+              sleep 5
+              echo "Init complete"
+      restartPolicy: Never
+      volumes:
+        - name: traccar-data
+          persistentVolumeClaim:
+            claimName: traccar-data
+        - name: traccar-logs
+          persistentVolumeClaim:
+            claimName: traccar-logs
+        - name: traccar-conf
+          persistentVolumeClaim:
+            claimName: traccar-conf
+        - name: traccar-web
+          persistentVolumeClaim:
+            claimName: traccar-web
+        - name: nfs-traccar
+          persistentVolumeClaim:
+            claimName: nfs-traccar-source
