@@ -1,6 +1,15 @@
 ---
 # Calico CNI Installation Playbook for K3s
 #
+# Verified working on: cyl-dc K3s 1.35.4+k3s1, 4 nodes, 2026-06-13
+# Calico version: v3.27.3 (direct calico-vxlan.yaml manifest, no Tigera operator)
+# Manifest source: https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico-vxlan.yaml
+# Tarball verified: /tmp/calico-v3.27.3.tgz (608MB) sha256 in /tmp/calico-manifests/
+# IPPool: 10.42.0.0/16 (K3s default pod CIDR)
+# Encapsulation: VXLAN Always, IPIP Never, FELIX_VXLANMTU=1370 (WireGuard MTU 1420 - 50)
+# DO NOT use Tigera operator — `installations.operator.tigera.io` CRD is 1.39MB,
+# K3s hardcoded 256KB annotation cap rejects it. Direct manifest path only.
+#
 # This playbook replaces the default k3s Flannel CNI with Calico for
 # NetworkPolicy enforcement. Default k3s Flannel is L3-only and silently
 # ignores NetworkPolicy objects — Calico is required for any pod-level
