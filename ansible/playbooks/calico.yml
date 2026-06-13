@@ -179,15 +179,15 @@
 
     - name: Wait for node to re-register in cluster
       ansible.builtin.shell: |
-        # First wait for k3s API to be ready
-        for j in {1..30}; do
+        # First wait for k3s API to be ready (up to 10 minutes)
+        for j in {1..60}; do
           if k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; then
             echo "k3s API ready after ${j}0 seconds"
             break
           fi
           sleep 10
         done
-        # Then check if our node is registered
+        # Then check if our node is registered (up to 5 more minutes)
         for i in {1..30}; do
           if k3s kubectl get node {{ inventory_hostname }} --no-headers 2>/dev/null | grep -q '{{ inventory_hostname }}'; then
             echo "Node re-registered after ${i}0 seconds"
