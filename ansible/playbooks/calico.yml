@@ -156,11 +156,10 @@
         mode: '0600'
         force: yes
 
-    - name: Start k3s service
-      ansible.builtin.systemd:
-        name: "{{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}"
-        state: started
-        enabled: true
+    - name: Start k3s service (don't wait for active — kubelet can't start without CNI)
+      ansible.builtin.shell: |
+        sudo systemctl start {{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}
+      changed_when: true
 
     - name: Wait for k3s process to be running
       ansible.builtin.shell: |
