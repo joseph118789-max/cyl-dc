@@ -1,0 +1,330 @@
+---
+# Calico CNI Installation Playbook for K3s
+#
+# This playbook replaces the default k3s Flannel CNI with Calico for
+# NetworkPolicy enforcement. Default k3s Flannel is L3-only and silently
+# ignores NetworkPolicy objects — Calico is required for any pod-level
+# network segmentation / zero-trust policies.
+#
+# Why Calico:
+#   - Enforces Kubernetes NetworkPolicy (Flannel does not)
+#   - Mature, widely used, well-supported on k3s
+#   - Uses the Kubernetes API as the datastore (no etcd dependency)
+#   - VXLAN overlay for pod-to-pod; BGP optional (we skip it — this
+#     cluster uses WireGuard overlay, no BGP peers to talk to)
+#
+# Why direct manifest (not Tigera operator):
+#   - The Tigera operator's `installations.operator.tigera.io` CRD is
+#     1.39MB. K3s has a hardcoded 256KB max annotation size. When K3s
+#     adds its bookkeeping annotations, the CRD exceeds the limit and
+#     K3s rejects it. This is a known K3s/Tigera operator compatibility
+#     issue. The direct manifest has no operator and no `installations`
+#     CRD — all CRDs are under 40KB each.
+#
+# Approach:
+#   1. Drain each node (cordon + drain)
+#   2. Stop k3s service
+#   3. Remove the k3s flannel CNI config
+#   4. Add /etc/rancher/k3s/config.yaml: --flannel-backend=none
+#      (workers get empty config — server-only flags must not be pushed
+#      to agents)
+#   5. Restart k3s on each node
+#   6. Apply Calico VXLAN manifest directly (no operator)
+#   7. Create IPPool for 10.42.0.0/16 (matches K3s default pod CIDR)
+#   8. Wait for calico-node daemonset and calico-kube-controllers
+#   9. Verify with a test NetworkPolicy
+#
+# Pre-flight requirements (MUST be true before running):
+#   - All fms workloads should have at least 1 replica and a sensible
+#     PodDisruptionBudget OR the operator should accept the brief downtime
+#   - K3s must be at v1.17+ (Calico requirement) — verify with:
+#       k3s kubectl version --short
+#   - Cluster must be healthy: `k3s kubectl get nodes` shows all 4 Ready
+#   - You should have rolled the JWT fix (Phase A from fms backend) BEFORE
+#     running this — the JWT fix removes the immediate need for netpol
+#     containment, and Calico install will cause ~5-10 min of cluster
+#     network disruption
+#
+# Usage:
+#   cd /root/projects/cyl-dc/ansible
+#   ansible-playbook -i inventory/hosts.ini playbooks/calico.yml
+#
+# Idempotency:
+#   - Re-running on a cluster that already has Calico: detects existing
+#     calico-system namespace and skips the install
+#   - Re-running on a cluster with Flannel still present: re-runs the
+#     uninstall + install flow
+
+- name: Calico CNI preflight checks
+  hosts: master[0]
+  become: true
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    calico_version: v3.27.3
+
+  tasks:
+    - name: Check that all cluster nodes are Ready
+      ansible.builtin.shell: |
+        k3s kubectl get nodes --no-headers | awk '{print $2}' | sort -u
+      register: node_status
+      changed_when: false
+      failed_when: node_status.stdout != "Ready"
+
+    - name: Check if Calico is already installed
+      ansible.builtin.shell: |
+        k3s kubectl get daemonset calico-node -n kube-system --no-headers 2>/dev/null
+      register: calico_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set Calico install flag
+      ansible.builtin.set_fact:
+        calico_already_installed: "{{ calico_check.rc == 0 and 'calico-node' in calico_check.stdout }}"
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: |
+          === Cluster Preflight ===
+          Nodes: {{ node_status.stdout }}
+          Calico already installed: {{ calico_already_installed }}
+
+- name: Drain all nodes and disable k3s Flannel
+  hosts: k3s_cluster
+  become: true
+  serial: 1
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: End play if Calico already installed
+      ansible.builtin.meta: end_play
+      when: hostvars[groups['master'][0]]['calico_already_installed']
+
+    - name: Cordon node
+      ansible.builtin.shell: |
+        k3s kubectl cordon {{ inventory_hostname }} 2>/dev/null || true
+      delegate_to: "{{ groups['master'][0] }}"
+      changed_when: false
+
+    - name: Drain node (skip daemonsets, ignore daemonset errors)
+      ansible.builtin.shell: |
+        k3s kubectl drain {{ inventory_hostname }} \
+          --ignore-daemonsets \
+          --delete-emptydir-data \
+          --force \
+          --grace-period=30 \
+          --timeout=120s 2>&1 || true
+      delegate_to: "{{ groups['master'][0] }}"
+      changed_when: false
+
+    - name: Stop k3s service
+      ansible.builtin.systemd:
+        name: "{{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}"
+        state: stopped
+
+    - name: Remove existing Flannel CNI config
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/agent/etc/cni/net.d/10-flannel.conflist
+        state: absent
+
+    - name: Write k3s config to disable Flannel (master)
+      when: inventory_hostname in groups['master']
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        content: |
+          flannel-backend: none
+        mode: '0600'
+        force: yes
+
+    - name: Write empty k3s config (worker — no server-only flags)
+      when: inventory_hostname in groups['worker']
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        content: ""
+        mode: '0600'
+        force: yes
+
+    - name: Start k3s service
+      ansible.builtin.systemd:
+        name: "{{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}"
+        state: started
+        enabled: true
+
+    - name: Wait for node to re-register as Ready
+      ansible.builtin.shell: |
+        for i in {1..30}; do
+          STATUS=$(k3s kubectl get node {{ inventory_hostname }} --no-headers 2>/dev/null | awk '{print $2}')
+          if [ "$STATUS" = "Ready" ]; then
+            echo "Node Ready after ${i}0 seconds"
+            break
+          fi
+          sleep 10
+        done
+        k3s kubectl get node {{ inventory_hostname }} --no-headers
+      delegate_to: "{{ groups['master'][0] }}"
+      changed_when: false
+      register: node_ready_check
+      failed_when: "'Ready' not in node_ready_check.stdout"
+
+- name: Apply Calico manifest (direct, no operator)
+  hosts: master[0]
+  become: true
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    calico_version: v3.27.3
+    calico_mtu: "1370"
+
+  tasks:
+    - name: End play if Calico already installed
+      ansible.builtin.meta: end_play
+      when: hostvars[groups['master'][0]]['calico_already_installed']
+
+    - name: Download Calico VXLAN manifest
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico-vxlan.yaml"
+        dest: /tmp/calico-vxlan.yaml
+        mode: '0644'
+
+    - name: Apply Calico VXLAN manifest
+      ansible.builtin.shell: |
+        k3s kubectl apply -f /tmp/calico-vxlan.yaml
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+
+    - name: Create Calico IPPool for 10.42.0.0/16 (K3s default pod CIDR)
+      ansible.builtin.copy:
+        dest: /tmp/calico-ippool.yaml
+        content: |
+          apiVersion: crd.projectcalico.org/v1
+          kind: IPPool
+          metadata:
+            name: default-ipv4-ippool
+          spec:
+            cidr: 10.42.0.0/16
+            encapsulation: VXLAN
+            natOutgoing: Enabled
+            blockSize: 26
+            nodeSelector: all()
+      notify: Apply Calico IPPool
+
+    - name: Apply Calico IPPool
+      ansible.builtin.shell: |
+        k3s kubectl apply -f /tmp/calico-ippool.yaml
+      register: ippool_apply
+      changed_when: "'created' in ippool_apply.stdout or 'configured' in ippool_apply.stdout"
+
+    - name: Patch calico-node DaemonSet — VXLAN Always (for WireGuard)
+      ansible.builtin.shell: |
+        k3s kubectl set env daemonset/calico-node -n kube-system \
+          CALICO_IPV4POOL_VXLAN=Always \
+          FELIX_VXLANMTU={{ calico_mtu }}
+      register: vxlan_patch
+      changed_when: "'calico-node' in vxlan_patch.stdout"
+
+    - name: Wait for calico-node daemonset to be ready
+      ansible.builtin.shell: |
+        for i in {1..60}; do
+          READY=$(k3s kubectl get daemonset calico-node -n kube-system --no-headers 2>/dev/null | awk '{print $4}')
+          DESIRED=$(k3s kubectl get daemonset calico-node -n kube-system --no-headers 2>/dev/null | awk '{print $2}')
+          if [ "$READY" = "$DESIRED" ] && [ -n "$READY" ]; then
+            echo "calico-node: $READY/$DESIRED ready"
+            break
+          fi
+          sleep 10
+        done
+        k3s kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+      register: calico_daemonset
+      changed_when: false
+      failed_when: "'Running' not in calico_daemonset.stdout"
+
+    - name: Wait for calico-kube-controllers deployment
+      ansible.builtin.shell: |
+        for i in {1..30}; do
+          READY=$(k3s kubectl get deployment calico-kube-controllers -n kube-system --no-headers 2>/dev/null | awk '{print $2}')
+          if [ "$READY" = "1/1" ]; then
+            echo "calico-kube-controllers ready"
+            break
+          fi
+          sleep 10
+        done
+        k3s kubectl get deployment calico-kube-controllers -n kube-system
+      register: calico_controllers
+      changed_when: false
+      failed_when: "'1/1' not in calico_controllers.stdout"
+
+- name: Verify NetworkPolicy enforcement works
+  hosts: master[0]
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: End play if Calico already installed
+      ansible.builtin.meta: end_play
+      when: hostvars[groups['master'][0]]['calico_already_installed']
+
+    - name: Deploy test netpol — deny all ingress to default namespace
+      ansible.builtin.shell: |
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: calico-test-deny-all
+          namespace: default
+        spec:
+          podSelector: {}
+          policyTypes:
+          - Ingress
+        EOF
+      register: netpol_apply
+      changed_when: "'created' in netpol_apply.stdout"
+
+    - name: Verify netpol applied
+      ansible.builtin.shell: |
+        k3s kubectl get networkpolicy calico-test-deny-all -n default
+      register: netpol_check
+      changed_when: false
+
+    - name: Remove test netpol
+      ansible.builtin.shell: |
+        k3s kubectl delete networkpolicy calico-test-deny-all -n default
+      changed_when: true
+
+- name: Uncordon all nodes
+  hosts: k3s_cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Uncordon node
+      ansible.builtin.shell: |
+        k3s kubectl uncordon {{ inventory_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      changed_when: false
+
+- name: Display final status
+  hosts: master[0]
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Show Calico status
+      ansible.builtin.shell: |
+        echo "=== Calico pods ==="
+        k3s kubectl get pods -n kube-system -l k8s-app=calico-node
+        k3s kubectl get pods -n kube-system -l k8s-app=calico-kube-controllers
+        echo ""
+        echo "=== Cluster nodes ==="
+        k3s kubectl get nodes -o wide
+        echo ""
+        echo "=== Calico IP pool ==="
+        k3s kubectl get ippool -o yaml
+      changed_when: false
+      register: calico_status
+
+    - name: Display Calico status
+      ansible.builtin.debug:
+        var: calico_status.stdout_lines
