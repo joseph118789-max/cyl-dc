@@ -156,10 +156,11 @@
         mode: '0600'
         force: yes
 
-    - name: Start k3s service (don't wait for active — kubelet can't start without CNI)
-      ansible.builtin.shell: |
-        sudo systemctl start {{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}
+    - name: Start k3s service (non-blocking — kubelet can't start without CNI)
+      ansible.builtin.shell: "sudo systemctl start {{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}"
       changed_when: true
+      async: 30
+      poll: 0
 
     - name: Wait for k3s process to be running
       ansible.builtin.shell: |
