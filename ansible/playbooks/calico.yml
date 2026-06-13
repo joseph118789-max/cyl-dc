@@ -238,7 +238,6 @@
             natOutgoing: Enabled
             blockSize: 26
             nodeSelector: all()
-      notify: Apply Calico IPPool
 
     - name: Apply Calico IPPool
       ansible.builtin.shell: |
