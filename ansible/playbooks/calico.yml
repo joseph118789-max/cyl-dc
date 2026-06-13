@@ -162,13 +162,20 @@
         state: started
         enabled: true
 
-    - name: Wait for k3s service to be active
-      ansible.builtin.systemd:
-        name: "{{ 'k3s' if inventory_hostname in groups['master'] else 'k3s-agent' }}"
-      register: k3s_status
-      until: k3s_status.status.ActiveState == 'active'
-      retries: 12
-      delay: 5
+    - name: Wait for k3s process to be running
+      ansible.builtin.shell: |
+        for i in {1..30}; do
+          if pgrep -f '/usr/local/bin/k3s' > /dev/null; then
+            echo "k3s process running"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "k3s process not running"
+        exit 1
+      changed_when: false
+      register: k3s_process
+      failed_when: k3s_process.rc != 0
 
     - name: Wait for node to re-register in cluster
       ansible.builtin.shell: |
