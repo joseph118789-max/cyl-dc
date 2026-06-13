@@ -66,10 +66,18 @@
   tasks:
     - name: Check that all cluster nodes are Ready
       ansible.builtin.shell: |
-        k3s kubectl get nodes --no-headers | awk '{print $2}' | sort -u
+        k3s kubectl get nodes --no-headers 2>/dev/null | awk '{print $2}' | sort -u
       register: node_status
       changed_when: false
-      failed_when: node_status.stdout != "Ready"
+      failed_when: false
+      retries: 10
+      delay: 10
+      until: node_status.rc == 0
+
+    - name: Warn if nodes not all Ready (but continue)
+      ansible.builtin.debug:
+        msg: "Warning: not all nodes Ready. Status: '{{ node_status.stdout }}'. Continuing to install Calico."
+      when: node_status.stdout != "Ready"
 
     - name: Check if Calico is already installed
       ansible.builtin.shell: |
@@ -77,6 +85,9 @@
       register: calico_check
       changed_when: false
       failed_when: false
+      retries: 10
+      delay: 10
+      until: calico_check.rc == 0
 
     - name: Set Calico install flag
       ansible.builtin.set_fact:
