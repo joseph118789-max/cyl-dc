@@ -7,13 +7,13 @@
 #   pg-b     = 10.0.0.2:2380  (VM 105, PVE2)
 #   etcd3    = 10.0.0.4:2380  (VM 106, PVE2)
 
-ETCD_NAME="{{ my_name }}"
+ETCD_NAME="{{ inventory_hostname }}"
 ETCD_INITIAL_CLUSTER="{{ etcd_initial_cluster }}"
 ETCD_INITIAL_CLUSTER_STATE="new"
-ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ my_ip }}:2380"
-ETCD_ADVERTISE_CLIENT_URLS="http://{{ my_ip }}:2379"
-ETCD_LISTEN_PEER_URLS="http://{{ my_ip }}:2380"
-ETCD_LISTEN_CLIENT_URLS="http://{{ my_ip }}:2379"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ wireguard_ip }}:2380"
+ETCD_ADVERTISE_CLIENT_URLS="http://{{ wireguard_ip }}:2379"
+ETCD_LISTEN_PEER_URLS="http://{{ wireguard_ip }}:2380"
+ETCD_LISTEN_CLIENT_URLS="http://{{ wireguard_ip }}:2379"
 ETCD_HEARTBEAT_INTERVAL="{{ etcd_heartbeat_interval }}"
 ETCD_ELECTION_TIMEOUT="{{ etcd_election_timeout }}"
 ETCD_DATA_DIR="/var/lib/etcd"
