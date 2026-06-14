@@ -1,0 +1,90 @@
+# Patroni config for {{ inventory_hostname }}
+# Managed by Ansible – cyl-dc/ansible/playbooks/patroni-ha.yml
+#
+# Cluster: cyl-dc-pg
+# DCS: etcd (all 3 members)
+# This node: {{ inventory_hostname }}
+
+name: {{ inventory_hostname }}
+
+scope: cyl-dc-pg
+namespace: db/
+dcs:
+  ttl: 30
+  loop_wait: 10
+  retry_timeout: 10
+  maximum_lag_on_failover: 1048576
+  postgresql:
+    use_pg_rewind: true
+    use_slots: true
+    parameters:
+      max_connections: {{ pg_max_connections }}
+      shared_buffers: {{ pg_shared_buffers }}
+      wal_level: replica
+      hot_standby: "on"
+      wal_keep_size: "128MB"
+      max_wal_senders: 10
+      max_replication_slots: 10
+      hot_standby_feedback: "on"
+      logging_collector: "off"
+      listen_addresses: "0.0.0.0"
+      port: {{ pg_port }}
+
+etcd:
+  hosts: "{{ etcd_dcs }}"
+  timeout: 10
+  retry_timeout: 10
+
+postgresql:
+  listen: "0.0.0.0:{{ pg_port }}"
+  connect_address: "{{ inventory_hostname }}:{{ pg_port }}"
+  data_dir: "{{ pg_data_dir }}"
+  bin_dir: "/usr/lib/postgresql/{{ pg_version }}/bin"
+  authentication:
+    replication:
+      username: replicator
+      password: "replicator_password"
+    superuser:
+      username: postgres
+      password: "postgres_password"
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    checkpoint: "fast"
+    max_rate: "100MB"
+    checkpoint_interval: "30s"
+
+# watchdog device – use software watchdog if no hardware device
+watchdog:
+  mode: automatic
+  device: /dev/watchdog
+
+# bootstrap section – only used when initializing a new cluster
+bootstrap:
+  dcs:
+    postgresql:
+      parameters:
+        max_connections: {{ pg_max_connections }}
+        shared_buffers: {{ pg_shared_buffers }}
+        wal_level: replica
+        hot_standby: "on"
+        wal_keep_size: "128MB"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        hot_standby_feedback: "on"
+        logging_collector: "off"
+        listen_addresses: "0.0.0.0"
+        port: {{ pg_port }}
+  initdb:
+    - encoding: UTF8
+    - locale: en_US.UTF-8
+  users:
+    admin:
+      password: "admin_password"
+      options:
+        - createrole
+        - createdb
+
+# restore command – used when promoting a replica
+# postgresql:
+#   restore_command: "cp /var/lib/postgresql/wal/%f %p"

@@ -1,0 +1,41 @@
+# PgBouncer config for Patroni HA PostgreSQL
+# Managed by Ansible – cyl-dc/ansible/playbooks/patroni-haproxy.yml
+#
+# pool_mode = transaction: connection is returned to pool after
+# each transaction. This works well with Patroni as the leader
+# can change during a transaction – the application must handle
+# connection reconnection.
+#
+# Use port 5000 as the client connection endpoint.
+# HAProxy routes client traffic to PgBouncer, PgBouncer routes
+# to the current Postgres leader.
+
+[databases]
+postgres = host=127.0.0.1 port={{ pg_port }} dbname=postgres
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = {{ pgbouncer_port }}
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+logfile = /var/log/pgbouncer/pgbouncer.log
+pidfile = /run/pgbouncer/pgbouncer.pid
+pool_mode = transaction
+max_client_conn = 200
+default_pool_size = 20
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 5
+max_db_connections = 50
+max_user_connections = 100
+server_reset_query = DISCARD ALL
+server_check_delay = 30
+server_lifetime = 3600
+server_idle_timeout = 600
+query_timeout = 0
+client_login_timeout = 60
+connect_timeout = 5000
+idle_server_timeout = 0
+suspend_timeout = 10
+vacuum_timeout = 10
+wait_timeout = 0

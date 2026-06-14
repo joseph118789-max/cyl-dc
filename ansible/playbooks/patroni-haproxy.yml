@@ -1,0 +1,167 @@
+---
+# HAProxy + PgBouncer for Patroni HA PostgreSQL
+# ============================================
+# HAProxy polls Patroni REST API (port 8008) on each node.
+# Patroni returns 200 OK only on the current leader.
+# HAProxy therefore routes writes to the correct node automatically.
+#
+# Ports:
+#   5000: pgBouncer (client connects here, routes to Postgres)
+#   5001: HAProxy stats (readonly)
+#   5432: Postgres direct (optional, not via pooler)
+#
+# PgBouncer pool settings:
+#   pool_mode: transaction (recommended for Patroni)
+#   max_client_conn: 200
+#   default_pool_size: 20
+
+- name: "HAProxy + PgBouncer – Install"
+  hosts: [pg-a, pg-b]
+  become: true
+  vars:
+    pg_port: 5432
+    pgbouncer_port: 5000
+    haproxy_stats_port: 5001
+
+  tasks:
+    - name: "Install HAProxy + socat"
+      ansible.builtin.apt:
+        pkg:
+          - haproxy
+          - socat
+        update_cache: true
+        state: present
+
+    - name: "Install PgBouncer"
+      ansible.builtin.apt:
+        pkg:
+          - pgbouncer
+        state: present
+
+    - name: "Stop default haproxy"
+      ansible.builtin.systemd:
+        name: haproxy
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: "Stop default pgbouncer"
+      ansible.builtin.systemd:
+        name: pgbouncer
+        state: stopped
+        enabled: false
+      failed_when: false
+
+
+- name: "HAProxy + PgBouncer – Configure"
+  hosts: [pg-a, pg-b]
+  become: true
+  vars:
+    pg_port: 5432
+    pgbouncer_port: 5000
+    haproxy_stats_port: 5001
+    cluster_name: "cyl-dc-pg"
+    etcd_members:
+      - { name: "pg-a", ip: "10.0.0.1" }
+      - { name: "pg-b", ip: "10.0.0.2" }
+      - { name: "witness", ip: "10.0.0.4" }
+
+  tasks:
+    - name: "Generate DCS endpoints for template"
+      ansible.builtin.set_fact:
+        etcd_dcs: >-
+          {%- set parts = [] -%}
+          {%- for m in etcd_members -%}
+          {%- set _ = parts.append('http://' + m.ip + ':2379') -%}
+          {%- endfor -%}
+          {{ parts | join(',') }}
+
+    - name: "Write HAProxy config"
+      ansible.builtin.template:
+        src: "../templates/haproxy.cfg.j2"
+        dest: "/etc/haproxy/haproxy.cfg"
+        mode: "0644"
+        owner: root
+        group: root
+      notify: "Restart HAProxy"
+
+    - name: "Create HAProxy service override dir"
+      ansible.builtin.file:
+        path: "/etc/systemd/system/haproxy.service.d"
+        state: directory
+        mode: "0755"
+
+    - name: "Write HAProxy systemd override (bind to specific IPs)"
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/haproxy.service.d/override.conf"
+        content: |
+          [Service]
+          # Ensure HAProxy binds to the WireGuard IP
+          ExecStartPre=/sbin/ip route get {{ hostvars[inventory_hostname].wireguard_ip }} || true
+        mode: "0644"
+      notify: "Restart HAProxy"
+
+    - name: "Daemon-reload haproxy"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "Enable + start HAProxy"
+      ansible.builtin.systemd:
+        name: haproxy
+        state: started
+        enabled: true
+
+    - name: "Write PgBouncer ini"
+      ansible.builtin.template:
+        src: "../templates/pgbouncer.ini.j2"
+        dest: "/etc/pgbouncer/pgbouncer.ini"
+        mode: "0644"
+        owner: pgbouncer
+        group: pgbouncer
+      notify: "Restart PgBouncer"
+
+    - name: "Write PgBouncer userlist"
+      ansible.builtin.copy:
+        dest: "/etc/pgbouncer/userlist.txt"
+        content: |
+          "postgres" "postgres_password"
+          "replicator" "replicator_password"
+          "admin" "admin_password"
+        mode: "0600"
+        owner: pgbouncer
+        group: pgbouncer
+      notify: "Restart PgBouncer"
+
+    - name: "Create PgBouncer run dir"
+      ansible.builtin.file:
+        path: "/run/pgbouncer"
+        state: directory
+        owner: pgbouncer
+        mode: "0755"
+
+    - name: "Enable + start PgBouncer"
+      ansible.builtin.systemd:
+        name: pgbouncer
+        state: started
+        enabled: true
+
+    - name: "Open firewall ports (ufw)"
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "{{ pgbouncer_port }}"
+        - "{{ haproxy_stats_port }}"
+      failed_when: false
+
+  handlers:
+    - name: "Restart HAProxy"
+      ansible.builtin.systemd:
+        name: haproxy
+        state: restarted
+
+    - name: "Restart PgBouncer"
+      ansible.builtin.systemd:
+        name: pgbouncer
+        state: restarted

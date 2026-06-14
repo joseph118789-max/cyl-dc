@@ -1,0 +1,68 @@
+# HAProxy config for Patroni HA PostgreSQL cluster
+# Managed by Ansible – cyl-dc/ansible/playbooks/patroni-haproxy.yml
+#
+# HAProxy polls Patroni REST API (port 8008) on each node.
+# A 200 OK response = this node is the current leader.
+# This allows automatic routing without any configuration changes
+# during failover.
+
+global
+    log /dev/log local0
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy.sock mode 600 level admin
+    stats timeout 30s
+    userlist haproxy_stats
+        group admin users admin
+        user admin insecure-password admin_password
+    maxconn 4096
+    daemon
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  500s
+    timeout server  500s
+    errorfile 400 /etc/haproxy/errors/400.http
+    errorfile 403 /etc/haproxy/errors/403.http
+    errorfile 408 /etc/haproxy/errors/408.http
+    errorfile 500 /etc/haproxy/errors/500.http
+    errorfile 502 /etc/haproxy/errors/502.http
+    errorfile 503 /etc/haproxy/errors/503.http
+    errorfile 504 /etc/haproxy/errors/504.http
+
+# ============================================================
+# Patroni health check – HTTP GET / on port 8008
+# 200 = leader, 503 = replica/standby
+# ============================================================
+listen patroni_health
+    bind :8008
+    option httpchk
+    http-check expect status 200
+    {% for member in etcd_members %}
+    server {{ member.name }} {{ member.ip }}:8008 check inter 3s fall 2 rise 1
+    {% endfor %}
+
+# ============================================================
+# Postgres write traffic – route to leader only
+# ============================================================
+listen postgres_write
+    bind 0.0.0.0:5432
+    option httpchk
+    http-check expect status 200
+    {% for member in etcd_members %}
+    server {{ member.name }} {{ member.ip }}:5432 check inter 3s fall 2 rise 1
+    {% endfor %}
+
+# ============================================================
+# HAProxy stats – readonly, on port 5001
+# ============================================================
+listen stats
+    bind 0.0.0.0:{{ haproxy_stats_port }}
+    mode http
+    stats enable
+    stats uri /
+    stats refresh 10s
+    stats auth admin:admin_password

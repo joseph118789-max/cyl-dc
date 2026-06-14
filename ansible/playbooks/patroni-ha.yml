@@ -1,0 +1,397 @@
+---
+# Patroni HA PostgreSQL cluster across 2 PVE sites
+# ================================================
+# Architecture (3 VMs, 2 sites):
+#   PVE1 (Site 1, 192.168.1.x):
+#     pg-a  (openclaw01, 192.168.1.239 / 10.0.0.1):  Postgres Node A + etcd member 1
+#   PVE2 (Site 2, 192.168.11.x):
+#     pg-b  (VM 105,  192.168.11.239 / 10.0.0.2):  Postgres Node B + etcd member 2
+#     witness (VM 106, 192.168.11.240 / 10.0.0.4):  etcd member 3 + Patroni witness only
+#
+# Quorum note: If PVE2 goes offline, PVE1 has 1/3 etcd votes and cannot
+# auto-failover. A 3rd physical PVE host would fix this. This is the best
+# possible config with 2-node hardware constraint.
+#
+# Ports used:
+#   etcd peer:   2380/tcp
+#   etcd client: 2379/tcp
+#   Patroni API: 8008/tcp
+#   Postgres:    5432/tcp
+#   HAProxy:     5000/tcp (optional, for connection routing)
+#
+# Verification:
+#   patronictl -c /etc/patroni/patroni.yml list
+#   etcdctl endpoint health
+#   etcdctl member list
+
+- name: "Patroni HA – Prerequisites"
+  hosts: patroni_cluster
+  gather_facts: true
+  become: true
+  vars:
+    pg_version: "16"
+    patroni_version: "4.0.1"
+    etcd_version: "3.9.0"
+    cluster_name: "cyl-dc-pg"
+    # Cross-site WireGuard IPs
+    etcd_members:
+      - { name: "pg-a", ip: "10.0.0.1", role: "data" }
+      - { name: "pg-b", ip: "10.0.0.2", role: "data" }
+      - { name: "witness", ip: "10.0.0.4", role: "witness" }
+    # Etcd timing tuned for ~50ms cross-site RTT
+    etcd_heartbeat_interval: "500"
+    etcd_election_timeout: "5000"
+    # Postgres settings
+    pg_port: 5432
+    pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
+    pg_max_connections: 200
+    pg_shared_buffers: "256MB"
+    # WireGuard MTU for MSS clamping
+    wg_mtu: 1420
+
+  tasks:
+    - name: "Ensure Python + pip + build deps"
+      ansible.builtin.apt:
+        pkg:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - libpq-dev
+          - build-essential
+          - libssl-dev
+          - pkg-config
+          - netcat
+        update_cache: true
+        state: present
+
+    - name: "Stop + disable default PostgreSQL (Patroni manages it)"
+      ansible.builtin.systemd:
+        name: "postgresql"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: "Install PostgreSQL {{ pg_version }}"
+      ansible.builtin.apt:
+        pkg:
+          - "postgresql-{{ pg_version }}"
+          - "postgresql-client-{{ pg_version }}"
+          - "postgresql-contrib-{{ pg_version }}"
+        state: present
+
+    - name: "Install Patroni via pip"
+      ansible.builtin.pip:
+        name:
+          - "patroni[etcd]=={{ patroni_version }}"
+          - "psycopg2-binary"
+        virtualenv: /opt/patroni-venv
+        virtualenv_command: "python3 -m venv"
+        state: present
+
+    - name: "Install etcd binaries (download if not present)"
+      block:
+        - name: "Check if etcd binary exists"
+          ansible.builtin.stat:
+            path: "/usr/local/bin/etcd"
+          register: etcd_binary
+
+        - name: "Download etcd {{ etcd_version }}"
+          ansible.builtin.get_url:
+            url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+            dest: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+            mode: "0644"
+          when: not etcd_binary.stat.exists
+
+        - name: "Extract etcd"
+          ansible.builtin.unarchive:
+            src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+            dest: "/tmp"
+            remote_src: true
+            creates: "/tmp/etcd-v{{ etcd_version }}-linux-amd64"
+          when: not etcd_binary.stat.exists
+
+        - name: "Install etcd binaries"
+          ansible.builtin.copy:
+            remote_src: true
+            src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/etcd/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            mode: "0755"
+          loop:
+            - etcd
+            - etcdctl
+          when: not etcd_binary.stat.exists
+      when: inventory_hostname in ['pg-a', 'pg-b', 'witness']
+
+    - name: "Create etcd data dir"
+      ansible.builtin.file:
+        path: "/var/lib/etcd"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "Create Patroni config dir"
+      ansible.builtin.file:
+        path: "/etc/patroni"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "Create postgres data dir"
+      ansible.builtin.file:
+        path: "{{ pg_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+
+    - name: "Create patroni run dir"
+      ansible.builtin.file:
+        path: "/run/patroni"
+        state: directory
+        owner: root
+        mode: "0755"
+
+
+- name: "Patroni HA – Etcd cluster setup"
+  hosts: patroni_cluster
+  gather_facts: true
+  become: true
+  vars:
+    pg_version: "16"
+    cluster_name: "cyl-dc-pg"
+    etcd_members:
+      - { name: "pg-a", ip: "10.0.0.1", role: "data" }
+      - { name: "pg-b", ip: "10.0.0.2", role: "data" }
+      - { name: "witness", ip: "10.0.0.4", role: "witness" }
+    etcd_heartbeat_interval: "500"
+    etcd_election_timeout: "5000"
+    wg_mtu: 1420
+
+  tasks:
+    - name: "Generate etcd initial cluster string"
+      ansible.builtin.set_fact:
+        etcd_initial_cluster: >-
+          {%- set parts = [] -%}
+          {%- for m in etcd_members -%}
+          {%- set _ = parts.append(m.name + '=http://' + m.ip + ':2380') -%}
+          {%- endfor -%}
+          {{ parts | join(',') }}
+
+    - name: "Generate etcdctl endpoints string"
+      ansible.builtin.set_fact:
+        etcdctl_endpoints: >-
+          {%- set parts = [] -%}
+          {%- for m in etcd_members -%}
+          {%- set _ = parts.append('http://' + m.ip + ':2379') -%}
+          {%- endfor -%}
+          {{ parts | join(',') }}
+
+    - name: "Write etcd config for {{ inventory_hostname }}"
+      ansible.builtin.template:
+        src: "../templates/etcd.conf.yml.j2"
+        dest: "/etc/etcd/etcd.conf.yml"
+        mode: "0644"
+        owner: root
+        group: root
+      vars:
+        my_name: "{{ (etcd_members | selectattr('ip', 'defined') | list)[0].name }}"
+        my_ip: "{{ (etcd_members | selectattr('ip', 'defined') | list)[0].ip }}"
+      when: inventory_hostname in ['pg-a', 'pg-b', 'witness']
+
+    - name: "Create etcd systemd override dir"
+      ansible.builtin.file:
+        path: "/etc/systemd/system/etcd.service.d"
+        state: directory
+        mode: "0755"
+
+    - name: "Add MSS clamping to etcd systemd (fix MTU issues)"
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/etcd.service.d/override.conf"
+        content: |
+          [Service]
+          ExecStartPost=/sbin/iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS -s %H -d 0/0 --set-mss 1360 || true
+        mode: "0644"
+      when: inventory_hostname in ['pg-a', 'pg-b', 'witness']
+
+    - name: "Daemon-reload etcd"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "Enable + start etcd"
+      ansible.builtin.systemd:
+        name: etcd
+        state: started
+        enabled: true
+      when: inventory_hostname in ['pg-a', 'pg-b', 'witness']
+
+    - name: "Wait for etcd to be ready on all members (60s)"
+      ansible.builtin.wait_for:
+        timeout: 60
+      delegate_to: pg-a
+      run_once: true
+      when: inventory_hostname == 'pg-a'
+
+    - name: "Verify etcd cluster health"
+      ansible.builtin.shell: |
+        export ETCDCTL_ENDPOINTS="{{ hostvars['pg-a'].etcdctl_endpoints }}"
+        etcdctl endpoint health --cluster
+      register: etcd_health
+      failed_when: false
+      when: inventory_hostname == 'pg-a'
+
+    - name: "Show etcd health result"
+      ansible.builtin.debug:
+        msg: "{{ etcd_health.stdout }}"
+      when: inventory_hostname == 'pg-a'
+
+
+- name: "Patroni HA – Patroni config + bootstrap"
+  hosts: patroni_cluster
+  gather_facts: true
+  become: true
+  vars:
+    pg_version: "16"
+    cluster_name: "cyl-dc-pg"
+    etcd_members:
+      - { name: "pg-a", ip: "10.0.0.1", role: "data" }
+      - { name: "pg-b", ip: "10.0.0.2", role: "data" }
+      - { name: "witness", ip: "10.0.0.4", role: "witness" }
+    pg_port: 5432
+    pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
+    pg_max_connections: 200
+    pg_shared_buffers: "256MB"
+    wg_mtu: 1420
+
+  tasks:
+    - name: "Determine node role"
+      ansible.builtin.set_fact:
+        is_witness: "{{ (inventory_hostname == 'witness') | bool }}"
+        is_first_node: "{{ (inventory_hostname == 'pg-a') | bool }}"
+
+    - name: "Generate etcdctl endpoints for patroni config"
+      ansible.builtin.set_fact:
+        etcd_dcs: >-
+          {%- set parts = [] -%}
+          {%- for m in etcd_members -%}
+          {%- set _ = parts.append('http://' + m.ip + ':2379') -%}
+          {%- endfor -%}
+          {{ parts | join(',') }}
+
+    - name: "Write Patroni config for {{ inventory_hostname }}"
+      ansible.builtin.template:
+        src: "../templates/patroni.yml.j2"
+        dest: "/etc/patroni/patroni.yml"
+        mode: "0644"
+        owner: root
+        group: root
+      notify: "Restart Patroni"
+
+    - name: "Create patroni systemd override (set mtu)"
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/patroni.service.d/override.conf"
+        content: |
+          [Service]
+          ExecStartPost=/sbin/iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS -s %H -d 0/0 --set-mss 1360 || true
+        mode: "0644"
+      when: not is_witness | bool
+
+    - name: "Daemon-reload patroni"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "Enable + start Patroni"
+      ansible.builtin.systemd:
+        name: patroni
+        state: started
+        enabled: true
+      when: not is_witness | bool
+
+    # Witness node: patroni in witness mode (no postgres, just DCS metadata)
+    - name: "Write witness-only Patroni config"
+      ansible.builtin.template:
+        src: "../templates/patroni-witness.yml.j2"
+        dest: "/etc/patroni/patroni.yml"
+        mode: "0644"
+        owner: root
+        group: root
+      when: is_witness | bool
+      notify: "Restart Patroni"
+
+    - name: "Enable + start Patroni on witness"
+      ansible.builtin.systemd:
+        name: patroni
+        state: started
+        enabled: true
+      when: is_witness | bool
+
+    - name: "Wait for Patroni to start (30s)"
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 8008
+        delay: 5
+        timeout: 30
+      when: not is_witness | bool
+
+    - name: "Wait for Patroni on witness to start (30s)"
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 8008
+        delay: 5
+        timeout: 30
+      when: is_witness | bool
+
+    - name: "Bootstrap check – show cluster status from pg-a"
+      ansible.builtin.shell: |
+        export PATRONI_CONFIG_PATH=/etc/patroni/patroni.yml
+        patronictl -c /etc/patroni/patroni.yml list
+      register: cluster_status
+      when: inventory_hostname == 'pg-a'
+      failed_when: false
+
+    - name: "Show cluster status"
+      ansible.builtin.debug:
+        msg: "{{ cluster_status.stdout }}"
+      when: inventory_hostname == 'pg-a'
+
+  handlers:
+    - name: "Restart Patroni"
+      ansible.builtin.systemd:
+        name: patroni
+        state: restarted
+
+
+- name: "Patroni HA – Smoke test"
+  hosts: pg-a
+  gather_facts: false
+  become: true
+  vars:
+    cluster_name: "cyl-dc-pg"
+
+  tasks:
+    - name: "Wait for cluster to settle (30s)"
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: "Check cluster status"
+      ansible.builtin.shell: |
+        export PATRONI_CONFIG_PATH=/etc/patroni/patroni.yml
+        patronictl -c /etc/patroni/patroni.yml list
+      register: cluster_status
+      failed_when: false
+
+    - name: "Show cluster status"
+      ansible.builtin.debug:
+        msg: "{{ cluster_status.stdout }}{{ cluster_status.stderr }}"
+
+    - name: "Test PostgreSQL connection"
+      ansible.builtin.shell: |
+        psql -h 127.0.0.1 -p 5432 -U postgres -c "SELECT version();"
+      register: pg_test
+      failed_when: false
+
+    - name: "Show PostgreSQL version"
+      ansible.builtin.debug:
+        msg: "{{ pg_test.stdout }}"
