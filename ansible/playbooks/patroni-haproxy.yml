@@ -64,7 +64,7 @@
     etcd_members:
       - { name: "pg-a", ip: "10.0.0.1" }
       - { name: "pg-b", ip: "10.0.0.2" }
-      - { name: "witness", ip: "10.0.0.4" }
+      - { name: "etcd3", ip: "10.0.0.4" }
 
   tasks:
     - name: "Generate DCS endpoints for template"
