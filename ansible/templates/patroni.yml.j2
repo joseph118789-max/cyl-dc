@@ -9,6 +9,12 @@ name: {{ inventory_hostname }}
 
 scope: cyl-dc-pg
 namespace: db/
+
+# REST API — must be reachable on WireGuard IP for cross-node health checks
+restapi:
+  listen: "0.0.0.0:8008"
+  connect_address: "{{ wireguard_ip }}:8008"
+
 dcs:
   ttl: 30
   loop_wait: 10
