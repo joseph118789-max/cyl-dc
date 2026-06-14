@@ -103,12 +103,9 @@
       notify: "Restart PgBouncer"
 
     - name: "Write PgBouncer userlist"
-      ansible.builtin.copy:
+      ansible.builtin.template:
+        src: "../templates/pgbouncer.userlist.j2"
         dest: "/etc/pgbouncer/userlist.txt"
-        content: |
-          "postgres" "postgres_password"
-          "replicator" "replicator_password"
-          "admin" "admin_password"
         mode: "0600"
         owner: pgbouncer
         group: pgbouncer

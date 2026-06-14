@@ -1,0 +1,24 @@
+# ============================================================
+# Patroni cluster group variables
+# ============================================================
+# IMPORTANT: These contain placeholder passwords.
+# Before production use, encrypt this file with:
+#   ansible-vault encrypt group_vars/patroni_cluster.yml
+# and replace the placeholder values with real secrets.
+#
+# To generate random passwords:
+#   pwgen -s 32 1  (or any secure password generator)
+# ============================================================
+
+# PostgreSQL authentication passwords
+# These are used in:
+#   - patroni.yml.j2  (replication + superuser auth)
+#   - pgbouncer.ini.j2 (server_login_password)
+#   - pgbouncer userlist.txt (auth)
+patroni_postgres_password: "CHANGE_ME_postgres_password"
+patroni_replicator_password: "CHANGE_ME_replicator_password"
+patroni_admin_password: "CHANGE_ME_admin_password"
+
+# PgBouncer auth (server_login_password must match Postgres passwords above)
+pgbouncer_server_login_user: "postgres"
+pgbouncer_server_login_password: "{{ patroni_postgres_password }}"

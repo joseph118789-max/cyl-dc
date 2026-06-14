@@ -43,21 +43,19 @@ postgresql:
   authentication:
     replication:
       username: replicator
-      password: "replicator_password"
+      password: "{{ patroni_replicator_password }}"
     superuser:
       username: postgres
-      password: "postgres_password"
+      password: "{{ patroni_postgres_password }}"
   create_replica_methods:
     - basebackup
   basebackup:
     checkpoint: "fast"
     max_rate: "100MB"
-    checkpoint_interval: "30s"
 
-# watchdog device – use software watchdog if no hardware device
+# watchdog disabled — VMs don't have /dev/watchdog
 watchdog:
-  mode: automatic
-  device: /dev/watchdog
+  mode: off
 
 # bootstrap section – only used when initializing a new cluster
 bootstrap:
@@ -78,12 +76,6 @@ bootstrap:
   initdb:
     - encoding: UTF8
     - locale: en_US.UTF-8
-  users:
-    admin:
-      password: "admin_password"
-      options:
-        - createrole
-        - createdb
 
 # restore command – used when promoting a replica
 # postgresql:
