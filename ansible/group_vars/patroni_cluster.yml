@@ -22,3 +22,6 @@ patroni_admin_password: "CHANGE_ME_admin_password"
 # PgBouncer auth (server_login_password must match Postgres passwords above)
 pgbouncer_server_login_user: "postgres"
 pgbouncer_server_login_password: "{{ patroni_postgres_password }}"
+
+# HAProxy stats UI
+haproxy_stats_password: "CHANGE_ME_haproxy_stats_password"

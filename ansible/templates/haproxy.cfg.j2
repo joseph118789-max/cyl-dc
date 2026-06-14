@@ -16,7 +16,7 @@ global
     stats timeout 30s
     userlist haproxy_stats
         group admin users admin
-        user admin insecure-password admin_password
+        user admin insecure-password {{ haproxy_stats_password }}
     maxconn 4096
     daemon
 
