@@ -5,11 +5,11 @@
 # Members:
 #   pg-a     = 10.0.0.1:2380  (openclaw01, PVE1)
 #   pg-b     = 10.0.0.2:2380  (VM 105, PVE2)
-#   witness  = 10.0.0.4:2380  (VM 106, PVE2)
+#   etcd3    = 10.0.0.4:2380  (VM 106, PVE2)
 
 ETCD_NAME="{{ my_name }}"
 ETCD_INITIAL_CLUSTER="{{ etcd_initial_cluster }}"
-ETCD_INITIAL_CLUSTER_STATE="existing"
+ETCD_INITIAL_CLUSTER_STATE="new"
 ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ my_ip }}:2380"
 ETCD_ADVERTISE_CLIENT_URLS="http://{{ my_ip }}:2379"
 ETCD_LISTEN_PEER_URLS="http://{{ my_ip }}:2380"

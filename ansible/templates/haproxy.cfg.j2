@@ -1,10 +1,13 @@
 # HAProxy config for Patroni HA PostgreSQL cluster
 # Managed by Ansible – cyl-dc/ansible/playbooks/patroni-haproxy.yml
 #
-# HAProxy polls Patroni REST API (port 8008) on each node.
+# HAProxy polls Patroni REST API (port 8008) on each data node.
 # A 200 OK response = this node is the current leader.
 # This allows automatic routing without any configuration changes
 # during failover.
+#
+# db_members = patroni_data_nodes ONLY (pg-a, pg-b).
+# etcd3 is EXCLUDED — it has no Patroni (8008) and no Postgres (5432).
 
 global
     log /dev/log local0
@@ -36,23 +39,38 @@ defaults
 # ============================================================
 # Patroni health check – HTTP GET / on port 8008
 # 200 = leader, 503 = replica/standby
+# NOTE: iterates over db_members only (pg-a, pg-b)
 # ============================================================
 listen patroni_health
     bind :8008
     option httpchk
     http-check expect status 200
-    {% for member in etcd_members %}
+    {% for member in db_members %}
     server {{ member.name }} {{ member.ip }}:8008 check inter 3s fall 2 rise 1
     {% endfor %}
 
 # ============================================================
-# Postgres write traffic – route to leader only
+# Postgres write traffic – route to leader only (5432)
+# HAProxy httpchk sends 200 to leader, 503 to replicas
 # ============================================================
 listen postgres_write
     bind 0.0.0.0:5432
     option httpchk
     http-check expect status 200
-    {% for member in etcd_members %}
+    {% for member in db_members %}
+    server {{ member.name }} {{ member.ip }}:5432 check inter 3s fall 2 rise 1
+    {% endfor %}
+
+# ============================================================
+# Postgres read traffic – any available node (5433)
+# HAProxy httpchk sends 200 to leader OR replicas
+# For read scaling: also uses db_members
+# ============================================================
+listen postgres_read
+    bind 0.0.0.0:5433
+    option httpchk
+    http-check expect status 200
+    {% for member in db_members %}
     server {{ member.name }} {{ member.ip }}:5432 check inter 3s fall 2 rise 1
     {% endfor %}
 

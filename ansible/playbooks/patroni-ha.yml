@@ -19,30 +19,33 @@
 # behavior to avoid split-brain. True host-level HA needs a 3rd
 # physical failure domain.
 #
+# Inventory groups:
+#   patroni_data_nodes : pg-a, pg-b  (PostgreSQL + Patroni)
+#   etcd_nodes         : pg-a, pg-b, etcd3  (etcd only)
+#   haproxy_nodes      : pg-a, pg-b  (HAProxy + PgBouncer)
+#
 # Ports:
 #   etcd peer:   2380/tcp
 #   etcd client: 2379/tcp
 #   Patroni API: 8008/tcp
 #   Postgres:    5432/tcp
-#   HAProxy:     5000/tcp (PgBouncer), 5432 direct (optional)
+#   HAProxy:     5000/tcp (PgBouncer), 5432/5433 (db), 5001 (stats)
 #
 # Verification:
 #   patronictl -c /etc/patroni/patroni.yml list
 #   etcdctl endpoint health
 #   etcdctl member list
 
-- name: "Patroni HA – Prerequisites (data nodes)"
-  hosts: [pg-a, pg-b]
+- name: "Patroni HA – Prerequisites (data nodes only)"
+  hosts: patroni_data_nodes
   gather_facts: true
   become: true
   vars:
     pg_version: "16"
-    cluster_name: "cyl-dc-pg"
     pg_port: 5432
     pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
     pg_max_connections: 200
     pg_shared_buffers: "256MB"
-    wg_mtu: 1420
 
   tasks:
     - name: "Ensure Python + pip + build deps"
@@ -108,17 +111,16 @@
         mode: "0755"
 
 
-- name: "Patroni HA – Etcd (all 3 members: pg-a, pg-b, etcd3)"
-  hosts: [pg-a, pg-b, etcd3]
+- name: "Patroni HA – etcd cluster (all 3 members)"
+  hosts: etcd_nodes
   gather_facts: true
   become: true
   vars:
     etcd_version: "3.9.0"
-    cluster_name: "cyl-dc-pg"
     etcd_members:
-      - { name: "pg-a",  ip: "10.0.0.1" }
-      - { name: "pg-b",  ip: "10.0.0.2" }
-      - { name: "etcd3", ip: "10.0.0.4" }
+      - { name: "pg-a",   ip: "10.0.0.1" }
+      - { name: "pg-b",   ip: "10.0.0.2" }
+      - { name: "etcd3",  ip: "10.0.0.4" }
     # Tuned for ~50ms cross-site RTT between PVE1 and PVE2
     etcd_heartbeat_interval: "500"
     etcd_election_timeout: "5000"
@@ -156,7 +158,6 @@
             - etcd
             - etcdctl
           when: not etcd_binary.stat.exists
-      when: inventory_hostname in ['pg-a', 'pg-b', 'etcd3']
 
     - name: "Create etcd data dir"
       ansible.builtin.file:
@@ -174,7 +175,6 @@
           {%- set _ = parts.append(m.name + '=http://' + m.ip + ':2380') -%}
           {%- endfor -%}
           {{ parts | join(',') }}
-      when: inventory_hostname in ['pg-a', 'pg-b', 'etcd3']
 
     - name: "Write etcd config"
       ansible.builtin.template:
@@ -183,7 +183,6 @@
         mode: "0644"
         owner: root
         group: root
-      when: inventory_hostname in ['pg-a', 'pg-b', 'etcd3']
 
     - name: "Create etcd systemd override dir"
       ansible.builtin.file:
@@ -200,7 +199,6 @@
         name: etcd
         state: started
         enabled: true
-      when: inventory_hostname in ['pg-a', 'pg-b', 'etcd3']
 
 
 - name: "Patroni HA – Verify etcd cluster health"
@@ -209,9 +207,9 @@
   become: false
   vars:
     etcd_members:
-      - { name: "pg-a",  ip: "10.0.0.1" }
-      - { name: "pg-b",  ip: "10.0.0.2" }
-      - { name: "etcd3", ip: "10.0.0.4" }
+      - { name: "pg-a",   ip: "10.0.0.1" }
+      - { name: "pg-b",   ip: "10.0.0.2" }
+      - { name: "etcd3",  ip: "10.0.0.4" }
 
   tasks:
     - name: "Generate etcdctl endpoints"
@@ -248,25 +246,23 @@
         msg: "{{ etcd_members_list.stdout }}"
 
 
-- name: "Patroni HA – Patroni config + bootstrap (data nodes only)"
-  hosts: [pg-a, pg-b]
+- name: "Patroni HA – Patroni config (all data nodes)"
+  hosts: patroni_data_nodes
   gather_facts: true
   become: true
   vars:
     pg_version: "16"
-    cluster_name: "cyl-dc-pg"
     etcd_members:
-      - { name: "pg-a",  ip: "10.0.0.1" }
-      - { name: "pg-b",  ip: "10.0.0.2" }
-      - { name: "etcd3", ip: "10.0.0.4" }
+      - { name: "pg-a",   ip: "10.0.0.1" }
+      - { name: "pg-b",   ip: "10.0.0.2" }
+      - { name: "etcd3",  ip: "10.0.0.4" }
     pg_port: 5432
     pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
     pg_max_connections: 200
     pg_shared_buffers: "256MB"
-    wg_mtu: 1420
 
   tasks:
-    - name: "Generate etcdctl endpoints for patroni config"
+    - name: "Generate etcd endpoints for patroni config"
       ansible.builtin.set_fact:
         etcd_dcs: >-
           {%- for m in etcd_members -%}
@@ -280,7 +276,6 @@
         mode: "0644"
         owner: root
         group: root
-      notify: "Restart Patroni"
 
     - name: "Create patroni systemd override dir"
       ansible.builtin.file:
@@ -292,39 +287,79 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: "Enable + start Patroni"
+
+- name: "Patroni HA – Bootstrap: pg-a first (leader)"
+  hosts: pg-a
+  gather_facts: false
+  become: true
+  tasks:
+    - name: "Enable Patroni service (don't start yet)"
+      ansible.builtin.systemd:
+        name: patroni
+        enabled: true
+
+    - name: "Start Patroni on pg-a"
       ansible.builtin.systemd:
         name: patroni
         state: started
-        enabled: true
 
-    - name: "Wait for Patroni API to come up (30s)"
+    - name: "Wait for Patroni REST API on pg-a (30s)"
       ansible.builtin.wait_for:
         host: "127.0.0.1"
         port: 8008
         delay: 5
         timeout: 30
 
-  handlers:
-    - name: "Restart Patroni"
+    - name: "Check pg-a leader state"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8008/leader"
+        status_code: 200
+      register: pg_a_leader
+      failed_when: false
+
+    - name: "Show pg-a leader check result"
+      ansible.builtin.debug:
+        msg: "pg-a leader check: {{ pg_a_leader.status }}"
+
+    - name: "Pause to let pg-a settle as leader (20s)"
+      ansible.builtin.pause:
+        seconds: 20
+
+
+- name: "Patroni HA – Bootstrap: pg-b (replica)"
+  hosts: pg-b
+  gather_facts: false
+  become: true
+  tasks:
+    - name: "Enable Patroni service (don't start yet)"
       ansible.builtin.systemd:
         name: patroni
-        state: restarted
+        enabled: true
+
+    - name: "Start Patroni on pg-b"
+      ansible.builtin.systemd:
+        name: patroni
+        state: started
+
+    - name: "Wait for Patroni REST API on pg-b (30s)"
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 8008
+        delay: 5
+        timeout: 30
+
+    - name: "Pause to let pg-b join as replica (20s)"
+      ansible.builtin.pause:
+        seconds: 20
 
 
 - name: "Patroni HA – Smoke test"
   hosts: pg-a
   gather_facts: false
   become: true
-  vars:
-    cluster_name: "cyl-dc-pg"
 
   tasks:
-    - name: "Wait for cluster to settle (30s)"
-      ansible.builtin.pause:
-        seconds: 30
-
-    - name: "Check cluster status via patronictl"
+    - name: "Check full cluster status"
       ansible.builtin.shell: |
         export PATRONI_CONFIG_PATH=/etc/patroni/patroni.yml
         patronictl -c /etc/patroni/patroni.yml list
@@ -337,10 +372,10 @@
 
     - name: "Test PostgreSQL connection on pg-a"
       ansible.builtin.shell: |
-        psql -h 127.0.0.1 -p 5432 -U postgres -c "SELECT version();" 2>&1
-      register: pg_test
+        psql -h 127.0.0.1 -p 5432 -U postgres -c "SELECT pg_is_in_recovery();" 2>&1
+      register: pg_recovery_test
       failed_when: false
 
-    - name: "Show PostgreSQL version"
+    - name: "Show recovery status"
       ansible.builtin.debug:
-        msg: "{{ pg_test.stdout }}{{ pg_test.stderr }}"
+        msg: "pg-a recovery: {{ pg_recovery_test.stdout }}{{ pg_recovery_test.stderr }}"

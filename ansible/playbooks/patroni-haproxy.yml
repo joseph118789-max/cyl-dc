@@ -1,22 +1,23 @@
 ---
 # HAProxy + PgBouncer for Patroni HA PostgreSQL
 # ============================================
+# Runs on: haproxy_nodes (pg-a, pg-b only)
+# etcd3 is excluded — it has no Patroni REST API (8008) or Postgres (5432)
+#
 # HAProxy polls Patroni REST API (port 8008) on each node.
 # Patroni returns 200 OK only on the current leader.
 # HAProxy therefore routes writes to the correct node automatically.
 #
-# Ports:
-#   5000: pgBouncer (client connects here, routes to Postgres)
-#   5001: HAProxy stats (readonly)
-#   5432: Postgres direct (optional, not via pooler)
+# Listener ports:
+#   5432: Postgres write traffic (→ leader only via httpchk 200)
+#   5433: Postgres read traffic (→ replica/any node via httpchk 200)
+#   5000: PgBouncer (transaction pool, routes to local Postgres)
+#   5001: HAProxy stats
 #
-# PgBouncer pool settings:
-#   pool_mode: transaction (recommended for Patroni)
-#   max_client_conn: 200
-#   default_pool_size: 20
+# HAProxy does NOT speak to etcd3 — etcd3 has no Patroni/Postgres.
 
-- name: "HAProxy + PgBouncer – Install"
-  hosts: [pg-a, pg-b]
+- name: "HAProxy + PgBouncer – Install (data nodes only)"
+  hosts: haproxy_nodes
   become: true
   vars:
     pg_port: 5432
@@ -38,14 +39,14 @@
           - pgbouncer
         state: present
 
-    - name: "Stop default haproxy"
+    - name: "Stop default haproxy (we manage config)"
       ansible.builtin.systemd:
         name: haproxy
         state: stopped
         enabled: false
       failed_when: false
 
-    - name: "Stop default pgbouncer"
+    - name: "Stop default pgbouncer (we manage config)"
       ansible.builtin.systemd:
         name: pgbouncer
         state: stopped
@@ -53,29 +54,20 @@
       failed_when: false
 
 
-- name: "HAProxy + PgBouncer – Configure"
-  hosts: [pg-a, pg-b]
+- name: "HAProxy + PgBouncer – Configure (data nodes only)"
+  hosts: haproxy_nodes
   become: true
   vars:
     pg_port: 5432
     pgbouncer_port: 5000
     haproxy_stats_port: 5001
-    cluster_name: "cyl-dc-pg"
-    etcd_members:
-      - { name: "pg-a", ip: "10.0.0.1" }
-      - { name: "pg-b", ip: "10.0.0.2" }
-      - { name: "etcd3", ip: "10.0.0.4" }
+    # db_members: only patroni data nodes — NOT etcd3
+    # etcd3 has no Patroni (8008) and no Postgres (5432)
+    db_members:
+      - { name: "pg-a",  ip: "10.0.0.1" }
+      - { name: "pg-b",  ip: "10.0.0.2" }
 
   tasks:
-    - name: "Generate DCS endpoints for template"
-      ansible.builtin.set_fact:
-        etcd_dcs: >-
-          {%- set parts = [] -%}
-          {%- for m in etcd_members -%}
-          {%- set _ = parts.append('http://' + m.ip + ':2379') -%}
-          {%- endfor -%}
-          {{ parts | join(',') }}
-
     - name: "Write HAProxy config"
       ansible.builtin.template:
         src: "../templates/haproxy.cfg.j2"
@@ -85,21 +77,11 @@
         group: root
       notify: "Restart HAProxy"
 
-    - name: "Create HAProxy service override dir"
+    - name: "Create HAProxy systemd override dir"
       ansible.builtin.file:
         path: "/etc/systemd/system/haproxy.service.d"
         state: directory
         mode: "0755"
-
-    - name: "Write HAProxy systemd override (bind to specific IPs)"
-      ansible.builtin.copy:
-        dest: "/etc/systemd/system/haproxy.service.d/override.conf"
-        content: |
-          [Service]
-          # Ensure HAProxy binds to the WireGuard IP
-          ExecStartPre=/sbin/ip route get {{ hostvars[inventory_hostname].wireguard_ip }} || true
-        mode: "0644"
-      notify: "Restart HAProxy"
 
     - name: "Daemon-reload haproxy"
       ansible.builtin.systemd:
