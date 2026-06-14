@@ -48,6 +48,18 @@
     pg_shared_buffers: "256MB"
 
   tasks:
+    - name: "Fail if any password is still a CHANGE_ME placeholder"
+      ansible.builtin.assert:
+        that:
+          - patroni_postgres_password != "CHANGE_ME_postgres_password"
+          - patroni_replicator_password != "CHANGE_ME_replicator_password"
+          - haproxy_stats_password != "CHANGE_ME_haproxy_stats_password"
+        fail_msg: >
+          ERROR: One or more passwords are still set to CHANGE_ME_* placeholders.
+          Encrypt group_vars/patroni_cluster.yml with ansible-vault and replace
+          all CHANGE_ME_* values before applying this playbook.
+        success_msg: "All passwords replaced — safe to proceed"
+
     - name: "Ensure Python + pip + build deps"
       ansible.builtin.apt:
         pkg:
