@@ -9,8 +9,8 @@
 # HAProxy therefore routes writes to the correct node automatically.
 #
 # Listener ports:
-#   5432: Postgres write traffic (→ leader only via httpchk 200)
-#   5433: Postgres read traffic (→ replica/any node via httpchk 200)
+#   5432: Postgres write traffic (→ leader only, httpchk /leader 200)
+#   5433: Postgres replica-read (→ replicas only, httpchk /replica 200)
 #   5000: PgBouncer (transaction pool, routes to local Postgres)
 #   5001: HAProxy stats
 #
