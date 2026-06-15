@@ -1,0 +1,67 @@
+---
+# WireGuard setup for Patroni HA PostgreSQL cluster
+# ==================================================
+# Installs WireGuard on pg-a (openclaw01), pg-b (VM 105), etcd3 (VM 106)
+# and brings up the wg0 interface with the Patroni-specific mesh config.
+#
+# Config files: ansible/wg-patroni/wg0-{pg-a,vm105,vm106}.conf
+# IPs: pg-a=10.0.0.5, pg-b=10.0.0.6, etcd3=10.0.0.7
+#
+# Prerequisites: VMs must be reachable over LAN SSH.
+# ==================================================
+
+- name: "Install WireGuard on Patroni nodes"
+  hosts: etcd_nodes
+  gather_facts: true
+  become: true
+  vars:
+    wg_config_dir: /root/.openclaw/workspace/projects/cyl-dc/ansible/wg-patroni
+
+  tasks:
+    - name: "Ensure WireGuard package is installed"
+      ansible.builtin.apt:
+        name: wireguard
+        state: present
+        update_cache: true
+      register: wg_installed
+      until: wg_installed is succeeded
+      retries: 3
+      delay: 10
+
+    - name: "Copy WireGuard config for this node"
+      ansible.builtin.copy:
+        src: "{{ wg_config_dir }}/wg0-{{ inventory_hostname }}.conf"
+        dest: /etc/wireguard/wg0.conf
+        mode: "0600"
+        owner: root
+        group: root
+      notify: "Restart WireGuard"
+
+    - name: "Ensure wireguard kernel module is loaded"
+      ansible.builtin.modprobe:
+        name: wireguard
+        state: present
+
+    - name: "Enable wg-quick on boot and start interface"
+      ansible.builtin.systemd:
+        name: "wg-quick@wg0"
+        state: started
+        enabled: true
+
+    - name: "Verify WireGuard is up"
+      ansible.builtin.command: wg show wg0
+      register: wg_status
+      failed_when: false
+      changed_when: false
+
+    - name: "Show WireGuard status"
+      ansible.builtin.debug:
+        msg: |
+          {{ inventory_hostname }} WireGuard status:
+          {{ wg_status.stdout if wg_status.stdout else '(no output — may still be initializing)' }}
+
+  handlers:
+    - name: "Restart WireGuard"
+      ansible.builtin.systemd:
+        name: "wg-quick@wg0"
+        state: restarted
