@@ -64,8 +64,8 @@
     # db_members: only patroni data nodes — NOT etcd3
     # etcd3 has no Patroni (8008) and no Postgres (5432)
     db_members:
-      - { name: "pg-a",  ip: "10.0.0.1" }
-      - { name: "pg-b",  ip: "10.0.0.2" }
+      - { name: "pg-a",  ip: "10.0.0.5" }
+      - { name: "pg-b",  ip: "10.0.0.6" }
 
   tasks:
     - name: "Write HAProxy config"

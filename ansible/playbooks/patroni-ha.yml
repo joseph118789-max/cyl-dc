@@ -3,12 +3,12 @@
 # ================================================
 # Architecture (3 VMs, 2 sites):
 #   PVE1 (Site 1, 192.168.1.x):
-#     pg-a  (openclaw01, 192.168.1.239 / 10.0.0.1):
+#     pg-a  (openclaw01, 192.168.1.239 / 10.0.0.5):
 #       Postgres Node A + Patroni + etcd member 1
 #   PVE2 (Site 2, 192.168.11.x):
-#     pg-b  (VM 105, 192.168.11.239 / 10.0.0.2):
+#     pg-b  (VM 105, 192.168.11.239 / 10.0.0.6):
 #       Postgres Node B + Patroni + etcd member 2
-#     etcd3 (VM 106, 192.168.11.240 / 10.0.0.4):
+#     etcd3 (VM 106, 192.168.11.240 / 10.0.0.7):
 #       etcd member 3 only (NO PostgreSQL, NO Patroni)
 #
 # Quorum: 3 etcd votes total. Automatic failover works as long as
@@ -130,9 +130,9 @@
   vars:
     etcd_version: "3.9.0"
     etcd_members:
-      - { name: "pg-a",   ip: "10.0.0.1" }
-      - { name: "pg-b",   ip: "10.0.0.2" }
-      - { name: "etcd3",  ip: "10.0.0.4" }
+      - { name: "pg-a",   ip: "10.0.0.5" }
+      - { name: "pg-b",   ip: "10.0.0.6" }
+      - { name: "etcd3",  ip: "10.0.0.7" }
     # Tuned for ~50ms cross-site RTT between PVE1 and PVE2
     etcd_heartbeat_interval: "500"
     etcd_election_timeout: "5000"
@@ -219,9 +219,9 @@
   become: false
   vars:
     etcd_members:
-      - { name: "pg-a",   ip: "10.0.0.1" }
-      - { name: "pg-b",   ip: "10.0.0.2" }
-      - { name: "etcd3",  ip: "10.0.0.4" }
+      - { name: "pg-a",   ip: "10.0.0.5" }
+      - { name: "pg-b",   ip: "10.0.0.6" }
+      - { name: "etcd3",  ip: "10.0.0.7" }
 
   tasks:
     - name: "Generate etcdctl endpoints"
@@ -265,9 +265,9 @@
   vars:
     pg_version: "16"
     etcd_members:
-      - { name: "pg-a",   ip: "10.0.0.1" }
-      - { name: "pg-b",   ip: "10.0.0.2" }
-      - { name: "etcd3",  ip: "10.0.0.4" }
+      - { name: "pg-a",   ip: "10.0.0.5" }
+      - { name: "pg-b",   ip: "10.0.0.6" }
+      - { name: "etcd3",  ip: "10.0.0.7" }
     pg_port: 5432
     pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
     pg_max_connections: 200
