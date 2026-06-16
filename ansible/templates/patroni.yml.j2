@@ -87,13 +87,17 @@ bootstrap:
   initdb:
     - encoding: UTF8
     - locale: en_US.UTF-8
-  pg_hba:
-    - host all all 127.0.0.1/32 md5
-    - host all all 10.0.0.0/24 md5
-    - host all all 192.168.1.0/24 md5
-    - host all all 192.168.11.0/24 md5
-    - host replication replicator 10.0.0.0/24 md5
 
 # restore command – used when promoting a replica
 # postgresql:
 #   restore_command: "cp /var/lib/postgresql/wal/%f %p"
+
+# pg_hba – applied by Patroni on every config reload.
+# Top-level (not under bootstrap) so it survives a re-init/replica-attach.
+pg_hba:
+  - local all postgres peer
+  - host all all 127.0.0.1/32 md5
+  - host all all 10.0.0.0/24 md5
+  - host all all 192.168.1.0/24 md5
+  - host all all 192.168.11.0/24 md5
+  - host replication replicator 10.0.0.0/24 md5

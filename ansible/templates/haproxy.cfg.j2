@@ -14,11 +14,12 @@ global
     chroot /var/lib/haproxy
     stats socket /run/haproxy.sock mode 600 level admin
     stats timeout 30s
-    userlist haproxy_stats
-        group admin users admin
-        user admin insecure-password {{ haproxy_stats_password }}
     maxconn 4096
     daemon
+
+userlist haproxy_stats
+    group admin users admin
+    user admin insecure-password {{ haproxy_stats_password }}
 
 defaults
     log     global
@@ -37,29 +38,32 @@ defaults
     errorfile 504 /etc/haproxy/errors/504.http
 
 # ============================================================
-# Postgres write traffic – route to leader only (5432)
+# Postgres write traffic – route to leader only (5002)
+# Note: port 5432 is bound by Postgres itself on each data node.
+# HAProxy listens on 5002 (write) and 5003 (replica-read) on the LAN,
+# forwards to backend Postgres on :5432.
 # HAProxy checks /leader on port 8008 → 200 on leader, 503 on replicas
 # Traffic goes to :5432 (Postgres), health check to :8008 (Patroni)
 # ============================================================
 listen postgres_write
-    bind 0.0.0.0:5432
+    bind 0.0.0.0:5002
     option httpchk
-    http-check send method GET uri /leader
+    http-check send meth GET uri /leader
     http-check expect status 200
     {% for member in db_members %}
     server {{ member.name }} {{ member.ip }}:5432 check port 8008 inter 3s fall 2 rise 1
     {% endfor %}
 
 # ============================================================
-# Postgres replica-read traffic – replicas only, NOT leader (5433)
+# Postgres replica-read traffic – replicas only, NOT leader (5003)
 # HAProxy checks /replica on port 8008 → 503 on leader, 200 on replicas
 # Leader excluded from this pool by Patroni /replica semantics
 # Traffic goes to :5432 (Postgres), health check to :8008 (Patroni)
 # ============================================================
 listen postgres_replica
-    bind 0.0.0.0:5433
+    bind 0.0.0.0:5003
     option httpchk
-    http-check send method GET uri /replica
+    http-check send meth GET uri /replica
     http-check expect status 200
     {% for member in db_members %}
     server {{ member.name }} {{ member.ip }}:5432 check port 8008 inter 3s fall 2 rise 1
@@ -75,3 +79,4 @@ listen stats
     stats uri /
     stats refresh 10s
     stats auth admin:{{ haproxy_stats_password }}
+
