@@ -3,22 +3,26 @@
 #
 # Cluster: cyl-dc-pg
 # Members:
-#   pg-a     = 10.0.0.5:2380  (openclaw01, PVE1)
-#   pg-b     = 10.0.0.6:2380  (VM 105, PVE2)
-#   etcd3    = 10.0.0.7:2380  (VM 106, PVE2)
+#   pg-a     = 10.0.0.5:2380  (PVE1)
+#   pg-b     = 10.0.0.6:2380  (PVE2)
+#   etcd3    = 10.0.0.7:2380  (PVE2)
 
-ETCD_NAME="{{ inventory_hostname }}"
-ETCD_INITIAL_CLUSTER="{{ etcd_initial_cluster }}"
-ETCD_INITIAL_CLUSTER_STATE="{{ etcd_initial_cluster_state | default('new') }}"
-ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ wireguard_ip }}:2380"
-ETCD_ADVERTISE_CLIENT_URLS="http://{{ wireguard_ip }}:2379"
-ETCD_LISTEN_PEER_URLS="http://{{ wireguard_ip }}:2380"
-ETCD_LISTEN_CLIENT_URLS="http://{{ wireguard_ip }}:2379"
-ETCD_HEARTBEAT_INTERVAL="{{ etcd_heartbeat_interval }}"
-ETCD_ELECTION_TIMEOUT="{{ etcd_election_timeout }}"
-ETCD_DATA_DIR="/var/lib/etcd"
-ETCD_SNAPSHOT_COUNT="100"
-ETCD_MAX_SNAPSHOTS="5"
-ETCD_MAX_WALS="5"
-ETCD_QUOTA_BACKEND_BYTES="8589934592"
-ETCD_SNAPSHOT_INTERVAL="100"
+name: {{ inventory_hostname }}
+initial-cluster: {{ etcd_initial_cluster }}
+initial-cluster-state: {{ etcd_initial_cluster_state | default('new') }}
+initial-advertise-peer-urls: http://{{ wireguard_ip }}:2380
+advertise-client-urls: http://{{ wireguard_ip }}:2379
+listen-peer-urls: http://{{ wireguard_ip }}:2380
+listen-client-urls: http://{{ wireguard_ip }}:2379
+heartbeat-interval: {{ etcd_heartbeat_interval | default(500) }}
+election-timeout: {{ etcd_election_timeout | default(5000) }}
+data-dir: /var/lib/etcd
+snapshot-count: 100
+max-snapshots: 5
+max-wals: 5
+quota-backend-bytes: 8589934592
+snapshot-interval: 100
+
+# Enable v2 API — required for python-etcd 0.4.5 (used by Patroni 4.0.1)
+# v2 is deprecated in etcd 3.5; switch to patroni.dcs.etcd3 (gRPC) before etcd 3.6.
+enable-v2: true

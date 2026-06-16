@@ -71,7 +71,7 @@
           - build-essential
           - libssl-dev
           - pkg-config
-          - netcat
+          - netcat-openbsd
         update_cache: true
         state: present
 
@@ -89,6 +89,12 @@
           - "postgresql-client-{{ pg_version }}"
           - "postgresql-contrib-{{ pg_version }}"
         state: present
+
+    - name: "Generate en_US.UTF-8 locale (required for initdb)"
+      ansible.builtin.command: locale-gen en_US.UTF-8
+      args:
+        creates: /usr/lib/locale/en_US.UTF-8
+      changed_when: false
 
     - name: "Install Patroni via pip"
       ansible.builtin.pip:
@@ -128,7 +134,7 @@
   gather_facts: true
   become: true
   vars:
-    etcd_version: "3.9.0"
+    etcd_version: "3.5.17"
     etcd_members:
       - { name: "pg-a",   ip: "10.0.0.5" }
       - { name: "pg-b",   ip: "10.0.0.6" }
@@ -163,7 +169,7 @@
         - name: "Install etcd binaries"
           ansible.builtin.copy:
             remote_src: true
-            src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/etcd/{{ item }}"
+            src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/{{ item }}"
             dest: "/usr/local/bin/{{ item }}"
             mode: "0755"
           loop:
@@ -188,6 +194,12 @@
           {%- endfor -%}
           {{ parts | join(',') }}
 
+    - name: "Create etcd config dir"
+      ansible.builtin.file:
+        path: "/etc/etcd"
+        state: directory
+        mode: "0755"
+
     - name: "Write etcd config"
       ansible.builtin.template:
         src: "../templates/etcd.conf.yml.j2"
@@ -201,6 +213,28 @@
         path: "/etc/systemd/system/etcd.service.d"
         state: directory
         mode: "0755"
+
+    - name: "Create etcd systemd unit"
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=etcd key-value store
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=notify
+          ExecStart=/usr/local/bin/etcd --config-file=/etc/etcd/etcd.conf.yml
+          Restart=always
+          RestartSec=10s
+          LimitNOFILE=40000
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: "/etc/systemd/system/etcd.service"
+        mode: "0644"
+        owner: root
+        group: root
 
     - name: "Daemon-reload etcd"
       ansible.builtin.systemd:
@@ -274,13 +308,6 @@
     pg_shared_buffers: "256MB"
 
   tasks:
-    - name: "Generate etcd endpoints for patroni config"
-      ansible.builtin.set_fact:
-        etcd_dcs: >-
-          {%- for m in etcd_members -%}
-          http://{{ m.ip }}:2379{% if not loop.last %},{% endif %}
-          {%- endfor %}
-
     - name: "Write Patroni config"
       ansible.builtin.template:
         src: "../templates/patroni.yml.j2"
@@ -305,6 +332,32 @@
   gather_facts: false
   become: true
   tasks:
+    - name: "Create patroni systemd unit"
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Patroni HA PostgreSQL
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=postgres
+          Group=postgres
+          Environment="PATRONI_CONFIG_PATH=/etc/patroni/patroni.yml"
+          ExecStart=/opt/patroni-venv/bin/patroni /etc/patroni/patroni.yml
+          Restart=always
+          RestartSec=10s
+          KillMode=process
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: "/etc/systemd/system/patroni.service"
+        mode: "0644"
+        owner: root
+        group: root
+
     - name: "Enable Patroni service (don't start yet)"
       ansible.builtin.systemd:
         name: patroni

@@ -37,14 +37,19 @@ dcs:
       port: {{ pg_port }}
 
 etcd:
-  hosts: "{{ etcd_dcs }}"
+  hosts:
+{% for m in etcd_members %}
+    - {{ m.ip }}:2379
+{% endfor %}
   timeout: 10
   retry_timeout: 10
+  protocol: http
 
 postgresql:
   listen: "0.0.0.0:{{ pg_port }}"
   connect_address: "{{ wireguard_ip }}:{{ pg_port }}"
   data_dir: "{{ pg_data_dir }}"
+  config_dir: "/etc/postgresql/{{ pg_version }}/main"
   bin_dir: "/usr/lib/postgresql/{{ pg_version }}/bin"
   authentication:
     replication:
@@ -57,7 +62,7 @@ postgresql:
     - basebackup
   basebackup:
     checkpoint: "fast"
-    max_rate: "100MB"
+    max-rate: "100M"
 
 # watchdog disabled — VMs don't have /dev/watchdog
 watchdog:
