@@ -1,0 +1,209 @@
+---
+# Prometheus Stack (kube-prometheus-stack) Installation Playbook for K3s
+# Usage: ansible-playbook playbooks/prometheus.yml
+#
+# Installs: Prometheus Operator + Prometheus + Grafana + Alertmanager +
+#           node-exporter + kube-state-metrics
+# Storage: Longhorn PVC (20Gi Prometheus, 5Gi Grafana, 5Gi Alertmanager)
+# Retention: 15 days for Prometheus
+#
+# Prerequisites:
+#   - K3s cluster running
+#   - helm binary available on master node
+#   - kubectl configured on master node
+#   - Longhorn CSI deployed (for PVC storage class)
+
+- name: Install kube-prometheus-stack on K3s
+  hosts: master
+  become: yes
+  gather_facts: yes
+  vars:
+    prometheus_stack_version: "75.6.0"   # kube-prometheus-stack Helm chart version
+    prometheus_namespace: "monitoring"
+    prometheus_storage_class: "longhorn"  # Must exist in cluster (Longhorn CSI)
+    prometheus_storage_size: "20Gi"
+    grafana_storage_size: "5Gi"
+    alertmanager_storage_size: "5Gi"
+    prometheus_retention: "15d"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Install Helm (if not present)
+    # -------------------------------------------------------------------------
+    - name: Check if Helm is installed
+      ansible.builtin.shell:
+        cmd: which helm
+      register: helm_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Install Helm 3.x
+      ansible.builtin.shell:
+        cmd: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          mv /usr/local/bin/helm.v3 /usr/local/bin/helm 2>/dev/null || true
+      when: helm_check.rc != 0
+
+    - name: Add Prometheus Community Helm repo
+      ansible.builtin.shell:
+        cmd: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 2. Create monitoring namespace
+    # -------------------------------------------------------------------------
+    - name: Create monitoring namespace
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl create namespace {{ prometheus_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      register: monitoring_ns
+      changed_when: "'created' in monitoring_ns.stdout or 'unchanged' in monitoring_ns.stdout"
+
+    # -------------------------------------------------------------------------
+    # 3. Check if prometheus-stack is already installed
+    # -------------------------------------------------------------------------
+    - name: Check if kube-prometheus-stack is installed
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          helm list -n {{ prometheus_namespace }} -q
+      register: prom_stack_check
+      changed_when: false
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 4. Create Helm values file for kube-prometheus-stack
+    # -------------------------------------------------------------------------
+    - name: Create kube-prometheus-stack Helm values file
+      when: "'kube-prometheus-stack' not in prom_stack_check.stdout"
+      ansible.builtin.copy:
+        dest: "/tmp/prometheus-values.yaml"
+        content: |
+          # Prometheus spec
+          prometheus:
+            prometheusSpec:
+              retention: {{ prometheus_retention }}
+              storageSpec:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: {{ prometheus_storage_class }}
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: {{ prometheus_storage_size }}
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 1Gi
+                limits:
+                  cpu: 1000m
+                  memory: 2Gi
+
+          # Grafana
+          grafana:
+            enabled: true
+            persistence:
+              enabled: true
+              storageClassName: {{ prometheus_storage_class }}
+              size: {{ grafana_storage_size }}
+            # Default admin credentials — CHANGE after first login
+            # Password stored in secret: kube-prometheus-stack-grafana
+            adminPassword: prom-operator
+
+          # Alertmanager
+          alertmanager:
+            alertmanagerSpec:
+              storage:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: {{ prometheus_storage_class }}
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: {{ alertmanager_storage_size }}
+
+          # kube-state-metrics
+          kubeStateMetrics:
+            enabled: true
+
+          # node-exporter (one per node, DaemonSet)
+          nodeExporter:
+            enabled: true
+
+    # -------------------------------------------------------------------------
+    # 5. Deploy kube-prometheus-stack via Helm
+    # -------------------------------------------------------------------------
+    - name: Deploy kube-prometheus-stack via Helm
+      when: "'kube-prometheus-stack' not in prom_stack_check.stdout"
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            --namespace {{ prometheus_namespace }} \
+            --values /tmp/prometheus-values.yaml \
+            --version {{ prometheus_stack_version }}
+        register: prom_deploy
+        changed_when: "'deployed' in prom_deploy.stdout or 'installed' in prom_deploy.stdout"
+
+    # -------------------------------------------------------------------------
+    # 6. Wait for Prometheus operator to be ready
+    # -------------------------------------------------------------------------
+    - name: Wait for Prometheus operator to be ready
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl wait --for=condition=ready pod \
+            -l app.kubernetes.io/name=prometheus-operator \
+            -n {{ prometheus_namespace }} --timeout=300s
+      register: prom_operator_wait
+      changed_when: false
+      ignore_errors: true
+      retries: 3
+      delay: 15
+
+    # -------------------------------------------------------------------------
+    # 7. Verify all components are Running
+    # -------------------------------------------------------------------------
+    - name: Get monitoring namespace pod status
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl get pods -n {{ prometheus_namespace }} --no-headers
+      register: monitoring_pods
+      changed_when: false
+
+    - name: Display installation status
+      debug:
+        msg: |
+          kube-prometheus-stack installed.
+          Namespace: {{ prometheus_namespace }}
+          Chart version: {{ prometheus_stack_version }}
+          Storage: {{ prometheus_storage_class }} ({{ prometheus_storage_size }} Prometheus, {{ grafana_storage_size }} Grafana)
+          Retention: {{ prometheus_retention }}
+          
+          Access (port-forward from master node):
+          - Prometheus:  kubectl port-forward -n {{ prometheus_namespace }} svc/kube-prometheus-stack-prometheus 9090:9090
+          - Grafana:    kubectl port-forward -n {{ prometheus_namespace }} svc/kube-prometheus-stack-grafana 3000:80
+          - Alertmanager: kubectl port-forward -n {{ prometheus_namespace }} svc/kube-prometheus-stack-alertmanager 9093:9093
+          
+          Grafana admin user: admin
+          Grafana password: check secret 'kube-prometheus-stack-grafana'
+            kubectl get secret -n {{ prometheus_namespace }} kube-prometheus-stack-grafana -o jsonpath='{.data.admin-password}' | base64 -d
+
+    # -------------------------------------------------------------------------
+    # 8. Get service endpoints
+    # -------------------------------------------------------------------------
+    - name: Get monitoring services
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl get svc -n {{ prometheus_namespace }} -o wide
+      register: monitoring_svcs
+      changed_when: false
+
+    - name: Display key service endpoints
+      debug:
+        var: monitoring_svcs.stdout_lines

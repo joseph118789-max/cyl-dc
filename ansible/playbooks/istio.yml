@@ -1,15 +1,31 @@
 ---
-# Istio Installation Playbook for K3s
+# Istio Installation + Gateway Playbook for K3s
 # Usage: ansible-playbook playbooks/istio.yml
+#
+# Installs: istiod (control plane) + istio-ingressgateway + istio-egressgateway
+# Istio version: 1.29.1 (istiod + gateways installed together via profile=demo)
+#
+# Note: istiod control plane was pre-existing from Phase 1.
+#       This playbook adds ingress + egress gateways and creates fms-device namespace
+#       with istio-injection=enabled.
+#
+# Access to ingress gateway:
+#   - http:  http://192.168.1.150/   (mapped via existing MetalLB / nodeport)
+#   - https:  https://192.168.1.150/ (TLS termination at gateway)
+#   - Port forwards: kubectl port-forward -n istio-system svc/istio-ingressgateway 8080:80 8081:443
 
-- name: Install Istio on K3s Cluster
+- name: Install/Update Istio on K3s Cluster (profile=demo)
   hosts: master
   become: yes
   gather_facts: yes
   vars:
     istio_version: "1.29.1"
+    device_namespace: "fms-device"
 
   tasks:
+    # -------------------------------------------------------------------------
+    # 1. Download and install istioctl
+    # -------------------------------------------------------------------------
     - name: Download Istio
       ansible.builtin.get_url:
         url: "https://github.com/istio/istio/releases/download/{{ istio_version }}/istio-{{ istio_version }}-linux-amd64.tar.gz"
@@ -25,34 +41,76 @@
 
     - name: Install istioctl
       ansible.builtin.shell:
-        cmd: cp /tmp/istio-{{ istio_version }}/bin/istioctl /usr/local/bin/istioctl && chmod +x /usr/local/bin/istioctl
+        cmd: |
+          cp /tmp/istio-{{ istio_version }}/bin/istioctl /usr/local/bin/istioctl
+          chmod +x /usr/local/bin/istioctl
 
-    - name: Install Istio
+    # -------------------------------------------------------------------------
+    # 2. Install Istio profile=demo (control plane + ingress + egress gateways)
+    # -------------------------------------------------------------------------
+    - name: Install Istio (profile=demo — adds ingress + egress gateways)
       ansible.builtin.shell:
         cmd: |
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          istioctl install --set profile=default -y
+          istioctl install --set profile=demo -y
       register: istio_install
       changed_when: "'Installation complete' in istio_install.stdout"
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
-    - name: Enable sidecar injection for default namespace
+    # -------------------------------------------------------------------------
+    # 3. Verify gateway pods
+    # -------------------------------------------------------------------------
+    - name: Verify Istio system pods
       ansible.builtin.shell:
         cmd: |
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          kubectl label namespace default istio-injection=enabled --overwrite
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          kubectl get pods -n istio-system -o wide
+      register: istio_pods
+      changed_when: false
 
-    - name: Verify installation
+    - name: Get ingress gateway external IP / ports
       ansible.builtin.shell:
         cmd: |
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          kubectl get pods -n istio-system
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          kubectl get svc -n istio-system istio-ingressgateway -o wide
+      register: ingress_svc
+      changed_when: false
 
-    - name: Display results
-      ansible.builtin.debug:
-        var: verification.stdout_lines
+    # -------------------------------------------------------------------------
+    # 4. Create fms-device namespace with istio-injection=enabled
+    # -------------------------------------------------------------------------
+    - name: Create fms-device namespace with Istio injection
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl create namespace {{ device_namespace }} \
+            --labels "name={{ device_namespace }},istio-injection=enabled" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      register: device_ns
+      changed_when: "'created' in device_ns.stdout or 'unchanged' in device_ns.stdout"
+
+    # -------------------------------------------------------------------------
+    # 5. Display results
+    # -------------------------------------------------------------------------
+    - name: Display installation summary
+      debug:
+        msg: |
+          Istio installation complete.
+          Version: {{ istio_version }}
+          Profile: demo (istiod + ingress gateway + egress gateway)
+          
+          Ingress gateway:
+            External IP: 192.168.1.150 (via MetalLB / existing nodeport mapping)
+            HTTP port: 80
+            HTTPS port: 443
+            HBCP port: 15021
+            
+          fms-device namespace: {{ device_namespace }}
+          Istio injection: ENABLED — pods auto-enrolled in mesh with mTLS
+
+          To verify sidecar on a pod:
+            kubectl get pod <pod-name> -n {{ device_namespace }} -o jsonpath='{.spec.containers[*].name}'
+
+          To port-forward to ingress locally:
+            ssh user@192.168.1.150 -L 8080:localhost:80 -L 8443:localhost:443

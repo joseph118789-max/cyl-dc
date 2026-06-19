@@ -1,0 +1,264 @@
+---
+# Vault Installation Playbook for K3s (Standalone, Phase 2a)
+# Usage: ansible-playbook playbooks/vault.yml
+#
+# Installs HashiCorp Vault 1.20.x in standalone mode (file storage backend).
+# Phase 2a: dev mode → Phase 2b: promote to HA Raft + Longhorn PVC.
+#
+# Prerequisites:
+#   - K3s cluster running
+#   - helm binary available on master node (installed by this playbook if missing)
+#   - kubectl configured on master node (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)
+
+- name: Install HashiCorp Vault on K3s (Standalone)
+  hosts: master
+  become: yes
+  gather_facts: yes
+  vars:
+    vault_version: "0.30.1"           # Helm chart version
+    vault_namespace: "vault"
+    vault_storage_path: "/vault/data"  # file storage (Phase 2a)
+    # Phase 2b promotion: change to Longhorn PVC
+    # vault_storage_class: "longhorn"
+    # vault_storage_size: "5Gi"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Install Helm if not present
+    # -------------------------------------------------------------------------
+    - name: Check if Helm is installed
+      ansible.builtin.shell:
+        cmd: which helm
+      register: helm_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Install Helm 3.x
+      ansible.builtin.shell:
+        cmd: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          mv /usr/local/bin/helm.v3 /usr/local/bin/helm 2>/dev/null || true
+      when: helm_check.rc != 0
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Add HashiCorp Helm repo
+      ansible.builtin.shell:
+        cmd: helm repo add hashicorp https://helm.releases.hashicorp.com && helm repo update
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    # -------------------------------------------------------------------------
+    # 2. Create vault namespace
+    # -------------------------------------------------------------------------
+    - name: Create vault namespace
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl create namespace {{ vault_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      register: vault_ns
+      changed_when: "'created' in vault_ns.stdout or 'unchanged' in vault_ns.stdout"
+
+    # -------------------------------------------------------------------------
+    # 3. Install Vault via Helm (standalone, file storage, dev mode OFF)
+    # -------------------------------------------------------------------------
+    - name: Check if Vault is already installed
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          helm list -n {{ vault_namespace }} -q
+      register: vault_helm_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Create Vault Helm values file (Phase 2a — standalone, file backend)
+      when: "'vault' not in vault_helm_check.stdout"
+      ansible.builtin.copy:
+        dest: "/tmp/vault-values.yaml"
+        content: |
+          ui:
+            enabled: true
+            serviceType: ClusterIP
+
+          server:
+            ha:
+              enabled: false
+              replicas: 1
+
+            audit:
+              enabled: false
+
+            standalone:
+              enabled: true
+              config: |
+                ui = true
+                listener "tcp" {
+                  tls_disable = 1
+                  address = "[::]:8200"
+                  cluster_address = "[::]:8201"
+                }
+                storage "file" {
+                  path = "/vault/data"
+                }
+                default_lease_ttl = "768h"
+                max_lease_ttl = "8760h"
+                api_addr = "http://vault.vault.svc.cluster.local:8200"
+                cluster_addr = "https://vault.vault.svc.cluster.local:8201"
+
+            dev:
+              enabled: false
+
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+
+            persistence:
+              enabled: false
+
+            logLevel: info
+
+            containerSecurityContext:
+              enabled: true
+              capabilities:
+                add:
+                  - IPC_LOCK
+
+    - name: Deploy Vault via Helm (standalone mode)
+      when: "'vault' not in vault_helm_check.stdout"
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          helm upgrade --install vault hashicorp/vault \
+            --namespace {{ vault_namespace }} \
+            --values /tmp/vault-values.yaml \
+            --version {{ vault_version }}
+        register: vault_helm_deploy
+        changed_when: "'deployed' in vault_helm_deploy.stdout or 'installed' in vault_helm_deploy.stdout"
+
+    # -------------------------------------------------------------------------
+    # 4. Wait for Vault pod to be Running
+    # -------------------------------------------------------------------------
+    - name: Wait for Vault pod to be ready
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=vault \
+            -n {{ vault_namespace }} --timeout=240s
+      register: vault_wait
+      changed_when: false
+      ignore_errors: true
+      retries: 3
+      delay: 10
+
+    # -------------------------------------------------------------------------
+    # 5. Check if Vault is sealed (needs init) or already initialized
+    # -------------------------------------------------------------------------
+    - name: Check Vault seal status
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl exec -n {{ vault_namespace }} vault-0 -- vault status 2>&1
+      register: vault_status
+      changed_when: false
+
+    - name: Initialize Vault (only if sealed and not initialized)
+      when: "'Initialized.*false' in vault_status.stdout"
+      block:
+        - name: Initialize Vault with 1 key share (Phase 2a simplicity)
+          ansible.builtin.shell:
+            cmd: |
+              export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+              kubectl exec -n {{ vault_namespace }} vault-0 -- \
+                vault operator init -key-shares=1 -key-threshold=1 -format=json
+          register: vault_init
+          no_log: true   # Contains unseal key and root token
+
+        - name: Save init output locally (chmod 600, root only)
+          ansible.builtin.copy:
+            content: "{{ vault_init.stdout }}"
+            dest: "/opt/phase1-rotation/vault-init-output.json"
+            mode: '0600'
+          when: vault_init.changed
+
+        - name: Extract unseal key and root token
+          set_fact:
+            vault_unseal_key: "{{ (vault_init.stdout | from_json).unseal_keys_b64[0] }}"
+            vault_root_token: "{{ (vault_init.stdout | from_json).root_token }}"
+          no_log: true
+
+        - name: Unseal Vault
+          ansible.builtin.shell:
+            cmd: |
+              export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+              kubectl exec -n {{ vault_namespace }} vault-0 -- \
+                vault operator unseal {{ vault_unseal_key }}
+          no_log: true
+
+        - name: Save root token locally
+          ansible.builtin.copy:
+            content: "{{ vault_root_token }}"
+            dest: "/opt/phase1-rotation/vault-root-token"
+            mode: '0600'
+          when: vault_root_token | length > 0
+          no_log: true
+
+        - name: Display root token location (for playbook output only)
+          debug:
+            msg: |
+              Vault initialized and unsealed.
+              Root token saved to: /opt/phase1-rotation/vault-root-token (chmod 600)
+              Unseal key saved in: /opt/phase1-rotation/vault-init-output.json
+          no_log: false
+
+    # -------------------------------------------------------------------------
+    # 6. Verify Vault is unsealed
+    # -------------------------------------------------------------------------
+    - name: Verify Vault is operational and unsealed
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl exec -n {{ vault_namespace }} vault-0 -- vault status 2>&1
+      register: vault_verify
+      changed_when: false
+
+    - name: Display Vault status
+      debug:
+        msg: |
+          Vault installation complete.
+          Namespace: {{ vault_namespace }}
+          Version: {{ vault_version }}
+          Storage: file (standalone)
+          Status: {{ vault_verify.stdout_lines | join(' | ') }}
+          Vault UI: kubectl port-forward -n {{ vault_namespace }} svc/vault-ui 8200:8200
+          (then http://localhost:8200 — use root token to login)
+
+    # -------------------------------------------------------------------------
+    # 7. Create Kubernetes auth method (for app pods)
+    # -------------------------------------------------------------------------
+    - name: Enable Kubernetes auth method on Vault
+      when: "'Initialized.*true' in vault_status.stdout"
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl exec -n {{ vault_namespace }} vault-0 -- \
+            vault auth enable kubernetes 2>&1 || true
+      register: vault_k8s_auth
+      changed_when: false
+
+    - name: Configure Kubernetes auth (use cluster's service account issuer)
+      when: "'Initialized.*true' in vault_status.stdout"
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl exec -n {{ vault_namespace }} vault-0 -- \
+            vault write auth/kubernetes/config \
+              kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR" \
+              token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+              kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt 2>&1
+      register: vault_k8s_config
+      changed_when: false
+      ignore_errors: true

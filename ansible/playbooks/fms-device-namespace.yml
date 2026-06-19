@@ -1,0 +1,97 @@
+---
+# fms-device Namespace + Istio Sidecar Injection Playbook for K3s
+# Usage: ansible-playbook playbooks/fms-device-namespace.yml
+#
+# Creates the device-service Kubernetes namespace with Istio sidecar injection
+# enabled. Any pods deployed into this namespace will automatically get an
+# istio-proxy sidecar container injected.
+#
+# This is the target namespace for Phase 2 device-service.
+#
+# Prerequisites:
+#   - K3s cluster with Istio control plane (istiod) installed
+#   - kubectl configured on master node
+
+- name: Create fms-device namespace with Istio sidecar injection
+  hosts: master
+  become: yes
+  gather_facts: yes
+  vars:
+    device_namespace: "fms-device"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Check if namespace exists
+    # -------------------------------------------------------------------------
+    - name: Check if fms-device namespace exists
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl get namespace {{ device_namespace }} -o name
+      register: ns_check
+      changed_when: false
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 2. Create namespace with istio-injection label
+    # -------------------------------------------------------------------------
+    - name: Create fms-device namespace with Istio injection enabled
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl create namespace {{ device_namespace }} \
+            --labels "name={{ device_namespace }},istio-injection=enabled" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      register: ns_create
+      changed_when: "'created' in ns_create.stdout or 'unchanged' in ns_create.stdout"
+
+    # -------------------------------------------------------------------------
+    # 3. Verify namespace and labels
+    # -------------------------------------------------------------------------
+    - name: Verify namespace labels
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl get namespace {{ device_namespace }} --show-labels
+      register: ns_labels
+      changed_when: false
+
+    - name: Display namespace status
+      debug:
+        msg: |
+          fms-device namespace ready.
+          Namespace: {{ device_namespace }}
+          Labels: {{ ns_labels.stdout }}
+          
+          Istio sidecar injection is ENABLED on this namespace.
+          Any pod deployed here will automatically receive an istio-proxy sidecar.
+          
+          To deploy a service:
+          1. Build container image
+          2. kubectl apply -f <deployment>.yaml -n {{ device_namespace }}
+          3. Service will be auto-enrolled in Istio mesh (mTLS enabled)
+          
+          To verify sidecar injection on a running pod:
+            kubectl get pod <pod-name> -n {{ device_namespace }} -o jsonpath='{.spec.containers[*].name}'
+
+    # -------------------------------------------------------------------------
+    # 4. Create a placeholder ServiceAccount for device-service (Phase 2a scaffold)
+    # -------------------------------------------------------------------------
+    - name: Create device-service ServiceAccount
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl create serviceaccount device-service-sa \
+            -n {{ device_namespace }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+      register: sa_create
+      changed_when: "'created' in sa_create.stdout or 'unchanged' in sa_create.stdout"
+      ignore_errors: true
+
+    - name: Display ServiceAccount info
+      debug:
+        msg: |
+          ServiceAccount 'device-service-sa' created in namespace {{ device_namespace }}.
+          This SA will be used by device-service pods for Kubernetes auth to Vault.
+          Vault policy path: secret/data/fms/device-service/db
+      when: sa_create.changed
