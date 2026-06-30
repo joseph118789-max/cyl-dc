@@ -1,0 +1,380 @@
+---
+# OpenShift 4.22 Compact Cluster on PVE2 (3 masters, no workers, no HAProxy)
+#
+# Architecture:
+#   master01.benz  192.168.11.121  (CP+worker)
+#   master02.benz  192.168.11.122  (CP+worker)
+#   master03.benz  192.168.11.123  (CP+worker)
+#   API VIP        192.168.11.110  (keepalived)
+#   Ingress VIP    192.168.11.111  (keepalived)
+#
+# Cluster FQDN: ocp.benz
+# baseDomain:  benz
+#
+# SAFE: never deletes existing PVE2 resources. Creates new VMIDs 110/111/112.
+# Creates ISO in local:iso (overwrite-protected), disk images on local1 (ZFS, 1TB+ free).
+
+- name: OpenShift 4.22 UPI - 3-node compact cluster on PVE2
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  collections:
+    - community.proxmox
+    - community.general
+    - ansible.builtin
+  vars:
+    pve2_api_host: "192.168.11.252"
+    pve2_api_token_id: "root@pam!oc1"
+    pve2_api_token_secret: "460a8e5b-2556-46e7-8e2b-f3808593d04b"
+    pve2_node: "pve2"
+    pve2_storage_iso: "local"
+    pve2_storage_vm: "local1"
+    pve2_bridge: "vmbr0"
+
+    ocp_base_domain: "benz"
+    ocp_cluster_name: "ocp"
+    ocp_vms:
+      - name: "master01.benz"
+        vmid: 110
+        ip: "192.168.11.121"
+      - name: "master02.benz"
+        vmid: 111
+        ip: "192.168.11.122"
+      - name: "master03.benz"
+        vmid: 112
+        ip: "192.168.11.123"
+    ocp_vip_api: "192.168.11.110"
+    ocp_vip_ingress: "192.168.11.111"
+    ocp_gateway: "192.168.11.2"
+    ocp_dns: "192.168.11.2"
+    ocp_vcpu: 8
+    ocp_memory_mb: 32768
+    ocp_disk_gb: 120
+
+    rhcos_iso_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.22/4.22.0/rhcos-4.22.0-x86_64-live-iso.x86_64.iso"
+    rhcos_iso_sha256: "a4f0115b9de378accb6359436f1869f6d5ef07840b51125217f9681c64eba9da"
+    rhcos_iso_dest: "/root/ocp/rhcos-live.iso"
+    rhcos_iso_pve_name: "rhcos-4.22.0-x86_64-live-iso.x86_64.iso"
+
+    openshift_install_dir: "/root/ocp"
+    pull_secret_path: "/root/pull-secret.txt"
+
+  tasks:
+    # ============================================================
+    # Phase 0: Preflight checks (no mutations)
+    # ============================================================
+    - name: "Phase 0.0 - Verify PVE2 API reachable"
+      ansible.builtin.uri:
+        url: "https://{{ pve2_api_host }}:8006/api2/json/version"
+        validate_certs: false
+        timeout: 10
+      register: pve2_version
+      retries: 3
+      delay: 5
+      until: pve2_version.status == 200
+
+    - name: "Phase 0.1 - Display PVE2 version"
+      ansible.builtin.debug:
+        var: pve2_version.json.data
+
+    - name: "Phase 0.2 - Verify target VMIDs are FREE on PVE2 (do not touch existing)"
+      ansible.builtin.uri:
+        url: "https://{{ pve2_api_host }}:8006/api2/json/cluster/resources?type=vm"
+        validate_certs: false
+        headers:
+          Authorization: "PVEAPIToken={{ pve2_api_token_id }}={{ pve2_api_token_secret }}"
+        timeout: 10
+      register: pve2_vms
+      failed_when: false
+
+    - name: "Phase 0.3 - Assert no VMID conflicts"
+      ansible.builtin.assert:
+        that:
+          - item.vmid | string not in (pve2_vms.json.data | map(attribute='vmid') | map('string') | list)
+        fail_msg: "VMID {{ item.vmid }} is already in use on PVE2. Pick a different VMID. (NOT deleting anything - this is a safety check.)"
+        success_msg: "VMID {{ item.vmid }} is free for {{ item.name }}"
+      loop: "{{ ocp_vms }}"
+
+    - name: "Phase 0.4 - Verify PVE2 storage has capacity"
+      ansible.builtin.uri:
+        url: "https://{{ pve2_api_host }}:8006/api2/json/nodes/{{ pve2_node }}/storage"
+        validate_certs: false
+        headers:
+          Authorization: "PVEAPIToken={{ pve2_api_token_id }}={{ pve2_api_token_secret }}"
+        timeout: 10
+      register: pve2_storage
+
+    - name: "Phase 0.5 - Verify required storage pools exist and have space"
+      ansible.builtin.assert:
+        that:
+          - item.storage in (pve2_storage.json.data | map(attribute='storage') | list)
+          - item.required_gb <= ((pve2_storage.json.data | selectattr('storage', 'equalto', item.storage) | map(attribute='avail', 0) | first) / 1024 / 1024 / 1024)
+        fail_msg: "Storage {{ item.storage }} missing or insufficient space. Available: {{ pve2_storage.json.data | selectattr('storage', 'equalto', item.storage) | map(attribute='avail', 0) | first | default(0) | human_readable }}"
+        success_msg: "Storage {{ item.storage }} OK: {{ ((pve2_storage.json.data | selectattr('storage', 'equalto', item.storage) | map(attribute='avail', 0) | first) / 1024 / 1024 / 1024) | round(1) }}GB free (need {{ item.required_gb }}GB)"
+      loop:
+        - { storage: "{{ pve2_storage_iso }}", required_gb: 2 }   # ISO ~1.3GB
+        - { storage: "{{ pve2_storage_vm }}", required_gb: "{{ (ocp_disk_gb | int * ocp_vms | length) }}" }
+
+    # ============================================================
+    # Phase 1: Download RHCOS ISO (to openclaw01)
+    # ============================================================
+    - name: "Phase 1.0 - Ensure openclaw01 has RHCOS ISO (skip if already present with correct hash)"
+      block:
+        - name: "Phase 1.0a - Check existing ISO checksum"
+          ansible.builtin.stat:
+            path: "{{ rhcos_iso_dest }}"
+            checksum_algorithm: sha256
+          register: existing_iso
+
+        - name: "Phase 1.0b - Download RHCOS ISO if missing or hash mismatch"
+          ansible.builtin.get_url:
+            url: "{{ rhcos_iso_url }}"
+            dest: "{{ rhcos_iso_dest }}"
+            mode: "0600"
+            timeout: 600
+            checksum: "sha256:{{ rhcos_iso_sha256 }}"
+          when: not existing_iso.stat.exists or existing_iso.stat.checksum != rhcos_iso_sha256
+
+        - name: "Phase 1.0c - Verify ISO checksum"
+          ansible.builtin.stat:
+            path: "{{ rhcos_iso_dest }}"
+            checksum_algorithm: sha256
+          register: iso_check
+          failed_when: iso_check.stat.checksum != rhcos_iso_sha256
+
+    # ============================================================
+    # Phase 2: Upload RHCOS ISO to PVE2 (does NOT delete anything)
+    # ============================================================
+    - name: "Phase 2.0 - Check if ISO already exists on PVE2"
+      ansible.builtin.uri:
+        url: "https://{{ pve2_api_host }}:8006/api2/json/nodes/{{ pve2_node }}/storage/{{ pve2_storage_iso }}/content"
+        validate_certs: false
+        headers:
+          Authorization: "PVEAPIToken={{ pve2_api_token_id }}={{ pve2_api_token_secret }}"
+        timeout: 10
+      register: iso_list
+
+    - name: "Phase 2.1 - Determine if ISO upload is needed"
+      ansible.builtin.set_fact:
+        iso_already_present: "{{ rhcos_iso_pve_name in (iso_list.json.data | map(attribute='volid') | map('regex_replace', '^.*:iso/', '') | list) }}"
+
+    - name: "Phase 2.2 - Upload RHCOS ISO to PVE2 {{ pve2_storage_iso }} via API (multipart)"
+      ansible.builtin.command:
+        cmd: >
+          curl -sk -X POST
+          -H "Authorization: PVEAPIToken={{ pve2_api_token_id }}={{ pve2_api_token_secret }}"
+          -F "content=iso"
+          -F "filename=@{{ rhcos_iso_dest }}"
+          https://{{ pve2_api_host }}:8006/api2/json/nodes/{{ pve2_node }}/storage/{{ pve2_storage_iso }}/upload
+      when: not iso_already_present
+      register: iso_upload
+      changed_when: iso_upload.rc == 0
+      retries: 1
+      delay: 30
+      timeout: 1800  # 30 min max for 1.3GB upload
+
+    - name: "Phase 2.3 - Verify ISO is now on PVE2"
+      ansible.builtin.uri:
+        url: "https://{{ pve2_api_host }}:8006/api2/json/nodes/{{ pve2_node }}/storage/{{ pve2_storage_iso }}/content"
+        validate_certs: false
+        headers:
+          Authorization: "PVEAPIToken={{ pve2_api_token_id }}={{ pve2_api_token_secret }}"
+        timeout: 10
+      register: iso_verify
+      failed_when: rhcos_iso_pve_name not in (iso_verify.json.data | map(attribute='volid') | map('regex_replace', '^.*:iso/', '') | list)
+
+    # ============================================================
+    # Phase 3: Create 3 master VMs on PVE2 (NEW VMIDs, no deletion)
+    # ============================================================
+    - name: "Phase 3 - Create master VMs on PVE2"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pve2_api_host }}"
+        api_user: "{{ pve2_api_token_id }}"
+        api_token_id: "{{ pve2_api_token_id }}"
+        api_token_secret: "{{ pve2_api_token_secret }}"
+        validate_certs: false
+        node: "{{ pve2_node }}"
+        vmid: "{{ item.vmid }}"
+        name: "{{ item.name }}"
+        state: present
+        description: "OpenShift 4.22 compact cluster master - {{ item.name }}"
+        # Hardware
+        cores: "{{ ocp_vcpu }}"
+        memory: "{{ ocp_memory_mb }}"
+        # CPU
+        cpu: "host"
+        cpuunits: 1024
+        # Boot
+        boot: "order=scsi0;ide2;net0"
+        bootdisk: "scsi0"
+        # Disk (OS will be installed via ISO)
+        scsi:
+          scsi0: "{{ pve2_storage_vm }}:{{ ocp_disk_gb }},iothread=1,discard=on"
+        # IDE for CDROM
+        ide:
+          ide2: "{{ pve2_storage_iso }}:iso/{{ rhcos_iso_pve_name }},media=cdrom"
+        # Network
+        net:
+          net0: "virtio,bridge={{ pve2_bridge }},firewall=0"
+        # Machine type (Q35 for modern features)
+        machine: "q35"
+        # BIOS: OVMF (UEFI)
+        bios: "ovmf"
+        # EFI disk
+        efidisk0:
+          storage: "{{ pve2_storage_vm }}"
+          efitype: "4m"
+          pre_enrolled_keys: 0
+        # SCSI controller
+        scsihw: "virtio-scsi-single"
+        # Agent
+        agent: 1
+        # Tablet (helps with mouse in console)
+        tablet: 0
+        # Autostart (don't autostart, manual control)
+        onboot: 0
+        # Start now? No - we'll attach ignition first
+        started: false
+      loop: "{{ ocp_vms }}"
+      register: vm_creation
+      retries: 2
+      delay: 10
+
+    - name: "Phase 3.1 - Display VM creation results"
+      ansible.builtin.debug:
+        msg: "Created VM {{ item.item.name }} (VMID {{ item.item.vmid }}) - exists: {{ item.exists }}"
+      loop: "{{ vm_creation.results }}"
+
+    # ============================================================
+    # Phase 4: Generate OpenShift UPI manifests
+    # ============================================================
+    - name: "Phase 4.0 - Generate OpenShift UPI install-config.yaml"
+      ansible.builtin.template:
+        src: "../templates/install-config-pve2.yaml.j2"
+        dest: "{{ openshift_install_dir }}/install-config.yaml"
+        mode: "0600"
+
+    - name: "Phase 4.1 - Generate manifests"
+      ansible.builtin.command:
+        cmd: "./openshift-install create manifests"
+        chdir: "{{ openshift_install_dir }}"
+      register: manifests_gen
+      changed_when: manifests_gen.rc == 0
+
+    - name: "Phase 4.2 - Display manifest output"
+      ansible.builtin.debug:
+        var: manifests_gen.stdout_lines
+
+    - name: "Phase 4.3 - Add apiVIPs and ingressVIPs to cluster-infrastructure-02-config.yml"
+      ansible.builtin.lineinfile:
+        path: "{{ openshift_install_dir }}/manifests/cluster-infrastructure-02-config.yml"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        insertbefore: "platformSpec"
+      loop:
+        - regexp: "^  apiVIPs:"
+          line: "  apiVIPs: {{ ocp_vip_api }}"
+        - regexp: "^  ingressVIPs:"
+          line: "  ingressVIPs: {{ ocp_vip_ingress }}"
+
+    - name: "Phase 4.4 - Remove worker machineset (compact cluster, masters do worker work)"
+      ansible.builtin.file:
+        path: "{{ openshift_install_dir }}/openshift/99_openshift-cluster-api_worker-machineset-{{ '%02d' | format(item) }}.yaml"
+        state: absent
+      loop: [0, 1, 2]
+      failed_when: false
+
+    - name: "Phase 4.5 - Generate ignition configs"
+      ansible.builtin.command:
+        cmd: "./openshift-install create ignition-configs"
+        chdir: "{{ openshift_install_dir }}"
+      register: ignition_gen
+      changed_when: ignition_gen.rc == 0
+
+    # ============================================================
+    # Phase 5: Start HTTP server serving ignition + ISO
+    # ============================================================
+    - name: "Phase 5.0 - Serve ignition configs via HTTP on port 22624"
+      ansible.builtin.shell: |
+        cd {{ openshift_install_dir }}
+        nohup python3 -m http.server 22624 > /tmp/ignition-server.log 2>&1 &
+        echo $! > /tmp/ignition-server.pid
+        sleep 2
+      changed_when: true
+
+    - name: "Phase 5.1 - Display ignition server PID"
+      ansible.builtin.debug:
+        msg: "Ignition server PID: {{ lookup('file', '/tmp/ignition-server.pid') }}"
+
+    # ============================================================
+    # Phase 6: Power on VMs in sequence (master01 first as bootstrap)
+    # ============================================================
+    - name: "Phase 6.0 - Power on master01.benz (bootstrap)"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pve2_api_host }}"
+        api_user: "{{ pve2_api_token_id }}"
+        api_token_id: "{{ pve2_api_token_id }}"
+        api_token_secret: "{{ pve2_api_token_secret }}"
+        validate_certs: false
+        node: "{{ pve2_node }}"
+        vmid: "{{ ocp_vms[0].vmid }}"
+        state: started
+      register: vm1_start
+
+    - name: "Phase 6.1 - Wait 10 minutes for master01 to bootstrap"
+      ansible.builtin.pause:
+        minutes: 10
+        prompt: "Waiting for master01 to complete bootstrap..."
+
+    - name: "Phase 6.2 - Power on master02.benz"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pve2_api_host }}"
+        api_user: "{{ pve2_api_token_id }}"
+        api_token_id: "{{ pve2_api_token_id }}"
+        api_token_secret: "{{ pve2_api_token_secret }}"
+        validate_certs: false
+        node: "{{ pve2_node }}"
+        vmid: "{{ ocp_vms[1].vmid }}"
+        state: started
+      register: vm2_start
+
+    - name: "Phase 6.3 - Wait 2 minutes for master02 to join"
+      ansible.builtin.pause:
+        minutes: 2
+        prompt: "Waiting for master02 to join..."
+
+    - name: "Phase 6.4 - Power on master03.benz"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pve2_api_host }}"
+        api_user: "{{ pve2_api_token_id }}"
+        api_token_id: "{{ pve2_api_token_id }}"
+        api_token_secret: "{{ pve2_api_token_secret }}"
+        validate_certs: false
+        node: "{{ pve2_node }}"
+        vmid: "{{ ocp_vms[2].vmid }}"
+        state: started
+      register: vm3_start
+
+    # ============================================================
+    # Phase 7: Monitor cluster installation
+    # ============================================================
+    - name: "Phase 7.0 - Wait for cluster install to complete (up to 45 min)"
+      ansible.builtin.command:
+        cmd: "./openshift-install wait-for install-complete --log-level=info"
+        chdir: "{{ openshift_install_dir }}"
+      register: install_complete
+      async: 2700  # 45 minutes
+      poll: 60     # check every minute
+      changed_when: false
+      failed_when: install_complete.rc not in [0]
+
+    - name: "Phase 7.1 - Display install completion"
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "OpenShift 4.22 cluster installation COMPLETE"
+          - "API endpoint: https://{{ ocp_vip_api }}:6443"
+          - "Console: https://console-openshift-console.apps.{{ ocp_cluster_name }}.{{ ocp_base_domain }}"
+          - "Kubeconfig: {{ openshift_install_dir }}/auth/kubeconfig"
+          - "kubeadmin password: {{ openshift_install_dir }}/auth/kubeadmin-password"
+          - "==============================================="
